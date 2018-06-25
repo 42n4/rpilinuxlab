@@ -1,12 +1,45 @@
-## Emulacja linuxa Gentoo arm poprzez binfmt
-### https://wiki.gentoo.org/wiki/Embedded_Handbook/General/Compiling_with_qemu_user_chroot
+### Emulacja linuxa Gentoo arm poprzez binfmt z wykorzystaniem narzędzi gentools 
+#### https://github.com/pwasiewi/gentools
+#### Podstawowa konfiguracja gentoo arm
+```
+v r p     #zmienia na katalog z ustawieniami stage3/4 itp. lub bez mc uruchamia vim settings z tym katalogu
+v r f
+v r cross0
+v r arm1
+binfmt-run
+v r arm2  #zmienia także /etc/portage hosta na swój arma (CZASAMI SIĘ PRZYDAJE)
+```
+#### Chrootowanie się na środowisko gentoo arm7, CTRL-D wyjście lub komenda: exit 
+```
+v r e     #można w qemu chroocie wykonywać komendy linuxa arm
+```
+#### Zmiana gcc na 7.3.0-r3 (sprawdź czy największa możliwa wersja gcc i popraw w /usr/local/bin/v)
+```
+v r arm3
+```
+#### Kompilacja xorg-server, openbox
+```
+v r arm4
+```
+#### Zmiana /etc/portage z arm na hosta z /etc/portage.host (po etapie v r arm2)
+```
+vcdx64
+```
+#### Zmiana /etc/portage z hosta na arm z /etc/portage.arm
+```
+vcdarm
+```
 
-Generujemy skrośny kompilator:
+
+### Krok po kroku emulacja linuxa Gentoo arm poprzez binfmt
+#### https://wiki.gentoo.org/wiki/Embedded_Handbook/General/Compiling_with_qemu_user_chroot
+
+#### Generujemy skrośny kompilator:
 ```
 crossdev --target armv7a-hardfloat-linux-gnueabi  --stable  --gcc 7.3.0-r1 --libc 2.25-r11 --kernel 4.16.9 -oO /usr/portage
 ```
 
-Do crosstoolsów w katalogu /usr/armv7a-hardfloat-linux-gnueabi rozpakowujemy podstawowe pakiety linuxa gentoo na platformę armv7a-hardfloat http://distfiles.gentoo.org/releases/arm/autobuilds/20161129/stage3-armv7a_hardfp-20161129.tar.bz2 usuwając poprzednią zawartość.
+#### Do crosstoolsów w katalogu /usr/armv7a-hardfloat-linux-gnueabi rozpakowujemy podstawowe pakiety linuxa gentoo na platformę armv7a-hardfloat http://distfiles.gentoo.org/releases/arm/autobuilds/20161129/stage3-armv7a_hardfp-20161129.tar.bz2 usuwając poprzednią zawartość.
 
 ```
 [ -e /etc/binfmt.d/binfmt.conf ] && rm /etc/binfmt.d/binfmt.conf
