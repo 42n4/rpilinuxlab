@@ -29,15 +29,13 @@ ln -sfn /opt/android-sdk/platform-tools/adb /usr/local/bin/adb
 curl http://commondatastorage.googleapis.com/git-repo-downloads/repo > /usr/local/bin/repo
 chmod 755 /usr/local/bin/repo
 mkdir RR && cd RR
-repo init -u https://github.com/ResurrectionRemix/platform_manifest.git -b oreo
-#wersja krótszego pobierania: repo init -u https://github.com/ResurrectionRemix/platform_manifest.git -b oreo --depth=1
+repo init -u https://github.com/ResurrectionRemix/platform_manifest.git -b oreo --depth=1
 ```
-### Dodaję części firmowe, binarne Androida systemu
+### Dodaję odpowiednie części firmowe binarne Androida systemu przez np. recovery
 #### np. modem z wersji 21C działa z wszystkimi nie stockowymi systemami
 ##### https://forum.xda-developers.com/lg-g3/general/radio-modem-lg-g3-t3110376
 
-### Tworzę local_manifests z dopracowanymi sterownikami konkretnego modelu
-komórki
+### Tworzę local_manifests z dopracowanymi sterownikami konkretnego modelu komórki
 ```
 # https://github.com/TheMuppets/proprietary_vendor_lge/tree/lineage-15.1/d855
 # add file RR/.repo/local_manifests/roomservice.xml
@@ -61,19 +59,19 @@ komórki
   <project name="LineageOS/android_packages_resources_devicesettings" path="packages/resources/devicesettings" />
   <project name="ResurrectionRemix-Devices/proprietary_vendor_lge" path="vendor/lge" remote="github" revision="8.1" />
 </manifest>
-
-# lub po prostu
+# lub z https://github.com/LiquidRemix-Devices
+# lub pobierz gotowy plik local_manifests
 # https://github.com/G3-Development/local_manifests
 curl --create-dirs -L -o .repo/local_manifests/g3.xml -O -L https://raw.githubusercontent.com/G3-Development/local_manifests/8.1/g3.xml
 ```
 
-### Ściągam wskazane w manifeście dodatkowe sterowniki 
+### Ściągam wskazane w local_manifests dodatkowe sterowniki wraz z całym kodem Androida
 ```
 repo sync  -f --force-sync --no-clone-bundle -j$(nproc --all)
 #wersja bez tagów: repo sync  -f --force-sync --no-clone-bundle --no-tags -j$(nproc --all)
 ```
 
-### Sprawdzam, czy trzeba to zmnienić, jeśli kompiluje RR, a mam sterowniki z Lineage
+#### Sprawdzam, czy trzeba zmnienić lineage.mk, jeśli kompiluje RR, a mam sterowniki z Lineage
 ```
 # mv ./device/lge/d855/lineage.mk ./device/lge/d855/rr.mk
 # sed -i 's/lineage/rr/g' ./device/lge/d855/rr.mk
@@ -85,25 +83,41 @@ repo sync  -f --force-sync --no-clone-bundle -j$(nproc --all)
 eselect python set 2 # select python 2.7
 ```
 
-### Ustawiam najprostsze LC_ALL 
+#### Ustawiam najprostsze LC_ALL 
 export LC_ALL=C
 
-### Generuje OTA z nazwą romu i archiwami, gdzie wrzuca się kopie skompilowanego systemu
+#### Generuje OTA z nazwą romu i archiwami, gdzie wrzuca się kopie skompilowanego systemu
 ##### https://github.com/ResurrectionRemix/packages_apps_ResurrectionOTA
 
-### podmieniamy gcc na UBER gcc (można podmienić na inny lub nowszy UBER toolchain, a także zmieniając konfig w XML-u)
+#### Podmieniam gcc na UBER gcc (można podmienić na inny lub nowszy własny skompilowany UBER toolchain zmieniając konfig w *build/envsetup.sh*)
 ```
 git clone https://bitbucket.org/UBERTC/arm-linux-androideabi-4.9.git prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-UB-4.9
 git clone https://bitbucket.org/UBERTC/arm-eabi-4.9.git prebuilts/gcc/linux-x86/arm/arm-linux-eabi-UB-4.9
-mv prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9 prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9.orig
-mv prebuilts/gcc/linux-x86/arm/arm-eabi-4.8 prebuilts/gcc/linux-x86/arm/arm-eabi-4.8-orig
-cd prebuilts/gcc/linux-x86/arm
-ln -sfn arm-linux-androideabi-UB-4.9 arm-linux-androideabi-4.9
-ln -sfn arm-linux-eabi-UB-4.9 arm-eabi-4.8
-cd ../../../..
+#lub kompilujemy własny UBER toolchain
+mkdir UBERTC && cd UBERTC
+repo init -u https://github.com/UBERTC/uber-manifest.git -b master
+repo sync
+cd scripts
+#wybieramy z kilku wersji np.
+./arm-linux-androideabi-4.9
+./arm-eabi-4.9
+#skompilowany toolchain z katalogu UBERTC/out kopiujemy do prebuilts/gcc/linux-x86/arm/ usuwając poprzednie wersje 
+#w pliku: build/envsetup.sh
+#podmieniamy linię z wyrażeniem "toolchaindir=arm" np. na:
+        arm) toolchaindir=arm/arm-linux-androideabi-4.9/bin
+#lub
+        arm) toolchaindir=arm/arm-linux-androideabi-UB-4.9/bin
+#lub
+        arm) toolchaindir=arm/arm-linaro-7.2/bin
+```
+#### Pobieram CLANG w nowszej wersji i podobnie zmieniamy konfig w *build/envsetup.sh*
+```
+git clone https://github.com/USA-RedDragon/prebuilts_clang_host_linux-x86_7.0-DragonTC prebuilts/clang/host/linux-x86/clang7.0-DragonTC --depth=1
+#podmieniamy linię z wyrażeniem "local CLANG_VERSION" np. na:
+        local CLANG_VERSION=clang7.0-DragonTC
 ```
 
-### Kompiluje wybraną wersję Androida RR
+### Kompiluję wybraną wersję Androida RR
 ```
 . build/envsetup.sh && brunch d855
 cd ./out/target/product/<devicename>/
@@ -114,9 +128,21 @@ cd ./out/target/product/<devicename>/
 make clean
 repo sync -f --force-sync --no-clone-bundle -j$(nproc --all)
 #wersja bez tagów: repo sync  -f --force-sync --no-clone-bundle --no-tags -j$(nproc --all)
-. build/envsetup.sh && brunch d855
+. build/envsetup.sh
+lunch rr_d855-userdebug && time make bacon -j16
 ```
 
 # Inne odnośniki
+ - https://github.com/UBERTC/uber-manifest/tree/master
+ - https://forum.xda-developers.com/android/software/toolchain-uber-toolchains-t3527997
+ - https://forum.xda-developers.com/chef-central/android/guide-switching-to-custom-toolchain-t2927662
+ - https://github.com/nathanchance/gcc-prebuilts/
+ - https://github.com/USA-RedDragon
+ - https://github.com/itsHardStyl3r
+ - https://www.codeaurora.org/project/android-for-msm
+ - https://forum.xda-developers.com/lg-g3/development/rom-resurrectionremix-6-0-0-t3785384
+ - https://forum.xda-developers.com/galaxy-mega/development/rom-resurrection-remix-nougat-v5-8-1-t3558468
  - https://www.lineageosrom.com/2017/01/how-to-build-lineageos-rom-for-any.html
  - https://forum.xda-developers.com/chef-central/android/how-to-build-lineageos-14-1-t3551484
+ - https://forum.xda-developers.com/lg-g3/development/d85x-ls990-vs985-g3ds-romcrdroidalpha-t3701855
+ - https://github.com/crdroidandroid/crdroid_build
