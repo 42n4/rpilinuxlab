@@ -17,13 +17,14 @@ system google dostosowany do urządzeń przez grupy programistów typu *Lineage*
 potem zwykłych uzytkowników z forum np. xda.
 
 
-# Kompilacja Androida **Oreo** *ResurrectionRemix*
+# Kompilacja Androida Oreo *ResurrectionRemix* dla LG G3
 ##### https://github.com/ResurrectionRemix/platform_manifest/tree/oreo
 ##### https://github.com/G3-Development/local_manifests
 
 ### Inicjuje archiwum Androida Oreo 
 #### Wymagane około **140GB** na pełne archiwum bez opcji --depth=1 
 #### (126GB zajęła jedna kompilacja bez ccache, które zabiera dodatkowe 140GB)
+#### *Kompilacja trwa około 90 min na 4 rdzeniowym i7*
 ```
 ln -sfn /opt/android-sdk/platform-tools/adb /usr/local/bin/adb
 curl http://commondatastorage.googleapis.com/git-repo-downloads/repo > /usr/local/bin/repo
@@ -110,12 +111,6 @@ cd scripts
 #lub
         arm) toolchaindir=arm/arm-linaro-7.2/bin
 ```
-#### Pobieram CLANG w nowszej wersji i podobnie zmieniamy konfig w *build/envsetup.sh*
-```
-git clone https://github.com/USA-RedDragon/prebuilts_clang_host_linux-x86_7.0-DragonTC prebuilts/clang/host/linux-x86/clang7.0-DragonTC --depth=1
-#podmieniamy linię z wyrażeniem "local CLANG_VERSION" np. na:
-        local CLANG_VERSION=clang7.0-DragonTC
-```
 
 ### Kompiluję wybraną wersję Androida RR
 ```
@@ -138,11 +133,10 @@ lunch rr_d855-userdebug && time make bacon -j16
  - https://forum.xda-developers.com/chef-central/android/guide-switching-to-custom-toolchain-t2927662
  - https://github.com/nathanchance/gcc-prebuilts/
  - https://github.com/USA-RedDragon
+ - https://forum.xda-developers.com/android/software-hacking/llvm-clang-dragontc-future-t3318386
  - https://github.com/itsHardStyl3r
  - https://www.codeaurora.org/project/android-for-msm
  - https://forum.xda-developers.com/lg-g3/development/rom-resurrectionremix-6-0-0-t3785384
  - https://forum.xda-developers.com/galaxy-mega/development/rom-resurrection-remix-nougat-v5-8-1-t3558468
- - https://www.lineageosrom.com/2017/01/how-to-build-lineageos-rom-for-any.html
- - https://forum.xda-developers.com/chef-central/android/how-to-build-lineageos-14-1-t3551484
  - https://forum.xda-developers.com/lg-g3/development/d85x-ls990-vs985-g3ds-romcrdroidalpha-t3701855
  - https://github.com/crdroidandroid/crdroid_build
