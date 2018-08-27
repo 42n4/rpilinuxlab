@@ -1,3 +1,16 @@
+# AndroidLab
+### Własne kompilacje androida i jego kernela 
+Aby zainstalować skonpilowany kernel i system najpierw trzeba umieć zrootować telefon i zainstalować TWRP- uwaga ryzykowna operacja - uzywać metod i plików sprawdzonych najlepiej na forum xda <https://forum.xda-developers.com> lub android polska ma odnośniki do xda i komentarze <https://forum.android.com.pl/>)
+Dodano katalogi z przepisami na kompilacje androida i kerneli.
+ - https://github.com/pwasiewi/rpilinuxlab/tree/master/androidoreo
+ - https://github.com/pwasiewi/rpilinuxlab/tree/master/androidnougat
+ - https://github.com/pwasiewi/rpilinuxlab/tree/master/androidkernel
+
+### Inne tutoriale
+ - https://forum.xda-developers.com/android/general/guide-how-to-build-custom-roms-kernel-t3814251
+ - https://thealaskalinuxuser.wordpress.com/2018/08/03/video-tutorial-for-android-building-advanced-topics/
+
+
 # Raspberry Pi Lab 
 ## i nie tylko ;) https://wiki.gentoo.org/wiki/Embedded_systems/ARM_hardware_list
 #### Odnośniki https://github.com/pwasiewi/eulinks/tree/master/sw_raspberry
