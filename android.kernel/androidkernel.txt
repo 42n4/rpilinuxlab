@@ -11,7 +11,7 @@ git clone https://bitbucket.org/UBERTC/arm-eabi-4.9.git prebuilts/gcc/linux-x86/
 export ARCH=arm && export SUBARCH=arm && export CROSS_COMPILE=$(pwd)/prebuilts/gcc/linux-x86/arm/arm-linux-eabi-UB-4.9/bin/arm-eabi-
 ```
 
-### Sprawdzony linaro gcc 7.1 toolchain z 2017
+### Sprawdzony linaro gcc 7.2 toolchain z 2017
 #### https://forum.xda-developers.com/android/development/toolchains-gnu-linaro-5th-2017-t3606941
 ##### https://github.com/nathanchance/gcc-prebuilts
 ```
@@ -19,17 +19,17 @@ git clone --depth=1  https://github.com/nathanchance/gcc-prebuilts.git -b arm-li
 export ARCH=arm && export SUBARCH=arm && export CROSS_COMPILE=$(pwd)/gcc-prebuilts/bin/arm-linaro-linux-androideabi-
 ```
 
-
 ### Sprawdzony skompilowany własny toolchain UBERTC gcc
 ```
 mkdir UBERTC && cd UBERTC
 repo init -u https://github.com/UBERTC/uber-manifest.git -b master
-repo sync
+repo sync -j4
 cd scripts
 #wybieramy z kilku wersji np.
 ./arm-linux-androideabi-4.9
 ./arm-eabi-4.9
 #skompilowany toolchain z katalogu UBERTC/out kopiujemy do prebuilts/gcc/linux-x86/arm/ usuwając poprzednie wersje 
+export ARCH=arm && export SUBARCH=arm && export CROSS_COMPILE=$(pwd)/prebuilts/gcc/linux-x86/arm/arm-eabi-4.9
 ```
 
 
@@ -38,6 +38,8 @@ cd scripts
 git clone --depth=1 https://github.com/ppajda/kernel_g3.git -b los-15.1 g3k3rn3l
 ln -sfn $(pwd)/g3k3rn3l /usr/src/linux
 cd g3k3rn3l
+[ -L /usr/include/linux ] && rm /usr/include/linux
+[ ! -L /usr/include/linux ] && mv /usr/include/linux /usr/include/linux.417
 ln -sfn  $(pwd)/include/linux/ /usr/include/linux
 make clean && make mrproper && make lineageos_d855_defconfig
 #poprawki w .config i następnie: make oldconfig
@@ -64,50 +66,65 @@ zip -r9 d855UberKernel.zip * -x .git
 ### Inne opcje kompilacji
 ```
 ### wersja z oddzielnym katalogiem out dla poszczególnych wersji urządzenia
-mkdir -p out
-make O=out clean && make O=out mrproper && make O=out lineageos_d855_defconfig
-make O=out -j$(nproc --all)
+for i in d850 d851 d852 d855 f400 g3ds ls990 vs985; do
+ export ARCH=arm && export SUBARCH=arm && export CROSS_COMPILE=$(pwd)/../gcc-prebuilts/bin/arm-linaro-linux-androideabi-
+ mkdir -p $i;
+ make O=$i clean && make O=$i mrproper && make O=$i lineageos_${i}_defconfig
+ make O=$i -j$(nproc --all)
+ cp ../android_system_tools_dtbtool/dtbtool $i
+ cd $i
+ ./dtbtool -2 -o ./arch/arm/boot/dtb -s 2048 -p ./scripts/dtc/ ./arch/arm/boot/
+ cp ./arch/arm/boot/dtb ../../AnyKernel2G3/kernel_files/dtb-${i}
+ cp ./arch/arm/boot/zImage ../../AnyKernel2G3/kernel_files/zImage-${i}
+ cd ..
+done
 ```
 
 # Inne odnosniki:
+ - https://forum.xda-developers.com/android/software-hacking/reference-how-to-compile-android-kernel-t3627297
+ - [cherry pick and merge](https://forum.xda-developers.com/showthread.php?t=2763236)
+ - https://forum.xda-developers.com/android/software/guide-easy-kernel-building-tutorial-t3581057
+ - https://forum.xda-developers.com/galaxy-s6/general/guide-how-to-build-samsung-kernel-july-t3429355
+ - https://forum.xda-developers.com/chef-central/android/guide-how-to-build-android-kernel-t3654336
  - https://android.googlesource.com
  - https://source.codeaurora.org/quic/la
+ - https://forum.xda-developers.com/android/development/toolchains-gnu-linaro-5th-2017-t3606941
+ - https://github.com/nathanchance/build-tools-gcc
  - https://androidmodguide.blogspot.com/p/blog-page.html
  - https://jsteward.moe/category/gsoc-2018.html
  - http://xdshao.com/2018/04/10/Android-exploitation-Kernel-stack-buffer-overflow/
- - https://github.com/Artx-II/ultra_kernel_lge_g3
  - https://groups.google.com/forum/#!topic/android-contrib/VEhnuU887YY
 
-# Inne toolchainy nie testowane
+## Inne toolchainy nie testowane
 
-### android ndk toolchain
+#### android ndk toolchain
 ```
 export ARCH=arm && export SUBARCH=arm && export CROSS_COMPILE=/opt/android-ndk/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin/arm-linux-androideabi-
 ```
 
-### UBER androideabi toolchain (nowsza kompilacja)
+#### UBER androideabi toolchain (nowsza kompilacja)
 #### https://forum.xda-developers.com/android/software/toolchain-uber-toolchains-t3527997
 ```
 git clone https://bitbucket.org/matthewdalex/arm-linux-androideabi-4.9.git
 ```
-### linaro toolchain
+#### linaro toolchain
 ```
 git clone -b linaro-4.8 https://github.com/ArchiDroid/Toolchain prebuilts/gcc/linux-x86/arm/arm-linux-eabi-linaro-4.8
 cd ..; export ARCH=arm && export SUBARCH=arm && export CROSS_COMPILE=$(pwd)/prebuilts/gcc/linux-x86/arm/arm-linux-eabi-linaro-4.8/bin/arm-eabi- ; cd kernel_g3
 
 ```
-### Google toolchain
+#### Google toolchain
 ```
 git clone https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-eabi-4.7 prebuilts/gcc/linux-x86/arm/arm-eabi-4.7
 cd ..; export ARCH=arm && export SUBARCH=arm && export CROSS_COMPILE=$(pwd)/prebuilts/gcc/linux-x86/arm/arm-eabi-4.7/bin/arm-eabi- ; cd kernel_g3
 ```
-## UBER toolchain
+#### UBER toolchain
 ```
 git clone https://bitbucket.org/UBERTC/arm-linux-androideabi-4.9.git prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-UB-4.9
 export ARCH=arm && export SUBARCH=arm && export CROSS_COMPILE=$(pwd)/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-UB-4.9/bin/arm-linux-androideabi-
 #cd ..; export ARCH=arm && export SUBARCH=arm && export CROSS_COMPILE=$(pwd)/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-UB-4.9/bin/arm-linux-androideabi-; cd kernel_g3
 ```
-## snapdragon toolchain
+#### snapdragon toolchain
 ```
 wget https://developer.qualcomm.com/qfile/26662/snapdragon-llvm-6.0.2-linux64.tar.gz
 #unpack to /opt/android-ndk
@@ -116,7 +133,7 @@ wget https://developer.qualcomm.com/qfile/26662/snapdragon-llvm-6.0.2-linux64.ta
 export ARCH=arm && export SUBARCH=arm && export CROSS_COMPILE=/opt/snapdragon/bin/arm-linux-androideabi-
 ```
 
-### UBER arm-eabi toolchain z 2017 roku
+#### UBER arm-eabi toolchain z 2017 roku
 ```
 git clone https://bitbucket.org/matthewdalex/arm-eabi-4.9 prebuilts/gcc/linux-x86/arm/arm-eabi-4.9 --depth=1
 git clone https://bitbucket.org/matthewdalex/arm-linux-androideabi-4.9.git prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9 --depth=1
@@ -124,12 +141,37 @@ git clone https://bitbucket.org/matthewdalex/arm-linux-androideabi-5.x.git --dep
 export ARCH=arm && export SUBARCH=arm && export CROSS_COMPILE=$(pwd)/prebuilts/gcc/linux-x86/arm/arm-linux-eabi-UB-4.9/bin/arm-eabi-
 ```
 
-### nathan toolchain 2017 
+#### nathan toolchain 2017 
 ```
 git clone -b arm-linaro-7.x --depth=1 https://github.com/nathanchance/gcc-prebuilts prebuilts/gcc/linux-x86/arm/arm-linaro-7.x
 ```
-### clang toolchain RedDragon
+#### clang toolchain RedDragon
 ```
 git clone https://github.com/USA-RedDragon/prebuilts_clang_host_linux-x86_7.0-DragonTC prebuilts/clang/host/linux-x86/clang7.0-DragonTC --depth=1
 ```
 
+#### kompilacja linaro 7.3 - kernel nie zbootował
+```
+## kontener z ubuntu
+systemctl start lxd
+systemctl status lxd
+## wszystkie domyślne z założeniem bridge do komunikacji
+lxd init
+lxc launch ubuntu:18.04 myubuntu
+lxc list
+lxc exec myubuntu /bin/bash
+
+## po zalogowaniu na ubuntu
+apt update
+apt-get install flex bison ncurses-dev texinfo gcc gperf patch libtool automake g++ libncurses5-dev gawk subversion expat libexpat1-dev python-all-dev binutils-dev  bc libcloog-isl-dev libcap-dev autoconf libgmp-dev build-essential gcc-multilib g++-multilib pkg-config libmpc-dev libmpfr-dev autopoint gettext txt2man liblzma-dev libssl-dev libz-dev
+apt install g++-8 gcc-8 libc6-dev libc-dev make
+sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-7 700 --slave /usr/bin/g++ g++ /usr/bin/g++-7
+sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-8 800 --slave /usr/bin/g++ g++ /usr/bin/g++-8
+## as you can see the greater priority has gcc-8
+sudo update-alternatives --config gcc
+
+git clone https://github.com/USBhost/build-tools-gcc
+cd build-tools-gcc
+./build -h
+time ./build -a arm -s linaro -v 7 -p xz
+```
