@@ -26,17 +26,8 @@
 # Range form: keeps 2026xx out, lets the _pN revisions of 202408 through. Lift when
 # qemu moves its EDK2_OVMF_VERSION.
 >=sys-firmware/edk2-bin-202500
-# 2026-11-07: libfmt-12.2.0 (::gentoo) and cudnn-9.28.0.42 (::stuff) change a subslot that
-# pool gpkgs the images have INSTALLED were built against: spdlog-1.17.0-2, android-tools-36.0.1-2,
-# mangohud-0.8.4-1 and caffe2-9999-10 carry libfmt:0/12.1.0=, cudnn-frontend-1.28.0-3 carries
-# cudnn:0/9.27.0=. With --usepkg the slot-operator rebuild selects the SAME stale gpkg as the
-# "rebuild" (the installed instance and the pool file are one build id), which pulls the old
-# library back in: two libfmt / two cudnn in one slot and pass 1 aborts (nvidiahard, probed
-# 2026-11-07: --usepkg-exclude on every consumer resolves it, but that is a 3 h caffe2 source
-# build for a libfmt point release). The host builds first (same lineage): hold until its
-# rebuilt gpkgs are copied into the pool (build-pipeline.md §35), then lift both lines together.
->=dev-libs/libfmt-12.2
->=dev-libs/cudnn-9.28
+# libfmt-12.2 / cudnn-9.28 hold (2026-11-07) lifted 2026-11-14: the host rebuilt every consumer
+# against the new subslots and those gpkgs are in the pool (bin/binpkg2pool).
 
 # libddcutil aborts its client when a monitor answers VCP xDF with a version
 # outside the MCCS spec — this host's PG34WCDN says 2.18 — so ddcui dies with

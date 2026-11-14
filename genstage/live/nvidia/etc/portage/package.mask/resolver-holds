@@ -35,7 +35,7 @@
 # ~dev-python/apache-tvm-ffi-0.1.11. Lift when a tilelang accepts a newer tvm-ffi.
 >dev-python/apache-tvm-ffi-0.1.11
 
-# Qt 6.11.3 hold: moved to live/hardened/etc/portage/package.mask/qt-6.11-hold (2026-10-31).
+# Qt 6.11.3 hold: lifted 2026-11-13 — ::gentoo dropped Qt 6.11.2, so the hold masked every dev-qt ebuild.
 
 # 2026-10-28: sci-ml/datasets (every ::gentoo version up to 5.1.0) requires
 # <sci-ml/huggingface_hub-2, and ::stuff carries huggingface_hub-2.3.0.
