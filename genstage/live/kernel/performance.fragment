@@ -1,0 +1,72 @@
+# Kconfig fragment: throughput and responsiveness options for the hard profiles.
+#
+# WHY THIS FILE EXISTS: the image kernel is x86_64 defconfig + fragments, so it
+# never inherited the tuning that zen-sources (and every distro config shipping
+# it) assumes is switched on. Comparison of 2026-11-14 against the CachyOS
+# default build of the same 7.3.4 and against the zen tree itself:
+# ~/Claude/info/plan-kernel-performance-20261114.md. Nothing here weakens
+# hardened.fragment; where a symbol is a member of a choice the losing member
+# is cleared explicitly (merge_config.sh only ADDS lines, olddefconfig then
+# keeps the base config's member and drops ours without a word).
+#
+# CPU-agnostic on purpose: -march selection lives in native-cpu.fragment, which
+# only the AMD profiles carry.
+
+# --- memory ------------------------------------------------------------------
+# Transparent hugepages: absent from defconfig. 'always' because the large
+# consumers here (llama.cpp model mappings, PyTorch, linkers) never madvise;
+# switch at run time with /sys/kernel/mm/transparent_hugepage/enabled.
+# ZEN_INTERACTIVE's "background-reclaim hugepages" tweak is dead code without it.
+CONFIG_TRANSPARENT_HUGEPAGE=y
+CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS=y
+# CONFIG_TRANSPARENT_HUGEPAGE_MADVISE is not set
+# CONFIG_TRANSPARENT_HUGEPAGE_NEVER is not set
+# Multi-gen LRU: better reclaim decisions under memory pressure (heavy builds
+# next to a desktop). Run-time switch: /sys/kernel/mm/lru_gen/enabled.
+CONFIG_LRU_GEN=y
+CONFIG_LRU_GEN_ENABLED=y
+# zswap: compressed cache in front of the swap file, so a build that overshoots
+# RAM degrades instead of stalling the desktop on disk swap-in (2026-10-16
+# stall). Off at run time with zswap.enabled=0.
+CONFIG_ZSWAP=y
+CONFIG_ZSWAP_DEFAULT_ON=y
+CONFIG_ZSWAP_SHRINKER_DEFAULT_ON=y
+# zstd, not the Kconfig default lzo: better ratio, and a choice member again.
+CONFIG_ZSWAP_COMPRESSOR_DEFAULT_ZSTD=y
+# CONFIG_ZSWAP_COMPRESSOR_DEFAULT_LZO is not set
+CONFIG_ZSMALLOC=y
+# Pressure-stall information: /proc/pressure/*, what systemd-oomd and any
+# "is the box thrashing" check read. Costs nothing measurable when idle.
+CONFIG_PSI=y
+# CONFIG_PSI_DEFAULT_DISABLED is not set
+
+# --- block layer -------------------------------------------------------------
+# BFQ: ZEN_INTERACTIVE makes it the default for single-queue devices, but the
+# scheduler itself was never built, so every SATA disk fell back to mq-deadline.
+# With BFQ built, zen would put SATA SSDs on it too; the udev rule
+# 60-ioscheduler.rules (hardened layer) narrows that to rotational disks.
+CONFIG_IOSCHED_BFQ=y
+CONFIG_BFQ_GROUP_IOSCHED=y
+
+# --- Wine / Proton -----------------------------------------------------------
+# /dev/ntsync: in-kernel NT synchronisation objects, used by Wine >= 10 and
+# current Proton instead of esync/fsync. Built in, so nothing has to load it.
+CONFIG_NTSYNC=y
+
+# --- idle / network: made AVAILABLE, defaults unchanged -----------------------
+# TEO cpuidle governor: select with cpuidle.governor=teo (menu stays default).
+CONFIG_CPU_IDLE_GOV_TEO=y
+# BBR + fq: select with net.ipv4.tcp_congestion_control=bbr and
+# net.core.default_qdisc=fq (cubic + fq_codel stay default). TCP_CONG_ADVANCED
+# is the menu gate; without it BBR is invisible to Kconfig.
+CONFIG_TCP_CONG_ADVANCED=y
+CONFIG_TCP_CONG_CUBIC=y
+CONFIG_DEFAULT_CUBIC=y
+CONFIG_TCP_CONG_BBR=m
+CONFIG_NET_SCH_FQ=m
+
+# --- compiler ----------------------------------------------------------------
+# -O3 (zen restores the option mainline removed). Members of one choice.
+CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3=y
+# CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE is not set
+# CONFIG_CC_OPTIMIZE_FOR_SIZE is not set

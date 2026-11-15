@@ -1,0 +1,10 @@
+# I/O scheduler per disk type. Pairs with kernel/performance.fragment.
+#
+# zen-sources (ZEN_INTERACTIVE) defaults single-queue devices to BFQ and
+# multi-queue devices to Kyber. "Single-queue" is every SATA disk, SSDs
+# included — but BFQ's per-request bookkeeping only pays off where seeks are
+# expensive. So: rotational disks keep BFQ, SATA/SAS SSDs go back to
+# mq-deadline, NVMe is left on the kernel default (Kyber).
+# Check: cat /sys/block/sdX/queue/scheduler
+ACTION=="add|change", KERNEL=="sd[a-z]*", ENV{DEVTYPE}=="disk", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="bfq"
+ACTION=="add|change", KERNEL=="sd[a-z]*", ENV{DEVTYPE}=="disk", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="mq-deadline"

@@ -98,8 +98,16 @@
 #                   able candidate file, -a walks the reviewed file with
 #                   per-entry y/N ('yes y |' bulk-accepts). Native
 #                   profile: the live image's world; pseudo-profile 'host':
-#                   the RUNNING system's — the only verb 'host' takes.
+#                   the RUNNING system's.
 #                   Boards have no world file and are refused    [root for -i]
+#   thp [always|madvise|never]
+#                   pseudo-profile 'host' only: show or switch transparent
+#                   hugepages on the RUNNING kernel, at once and until the
+#                   next boot (the kernel default comes from
+#                   live/kernel/performance.fragment). No argument = status.
+#                   always: every large anonymous mapping (faster compiles,
+#                   slower llama.cpp CPU prompt — measured 2026-11-15);
+#                   madvise: only programs that ask for it      [root to set]
 #   run             xlab run for the profile's xlab target
 #   kernel          xlab kernel build (the QEMU lab, not the live image)
 #   binhost         serve binpkgs over HTTP: board = cross sysroot (xarm), live profile = image cache [PORT]
@@ -192,7 +200,7 @@ case "$1" in
 esac
 
 # a profile file named like a verb would shadow it — refuse such confs
-RESERVED=" status setup enter emerge 1by1 rootgcc sysroot-prep pkgs update lock unlock clean-world seed snapshot spec stage1 stage2 stage3 all verify crossstage log qlop qlog build rpi image gate run kernel livekernel rmkernel sd binhost distcc unpack conf configure restrict-run squash isolinux iso live usb xarm xstage xlab profiles help "
+RESERVED=" thp status setup enter emerge 1by1 rootgcc sysroot-prep pkgs update lock unlock clean-world seed snapshot spec stage1 stage2 stage3 all verify crossstage log qlop qlog build rpi image gate run kernel livekernel rmkernel sd binhost distcc unpack conf configure restrict-run squash isolinux iso live usb xarm xstage xlab profiles help "
 
 PROF=""
 if [[ -f ${PROFDIR}/$1.conf ]]; then
@@ -238,8 +246,8 @@ is_host()  { [[ ${PROF_KIND} == host ]]; }
 # host-maintenance verbs may pass; everything else must die before it can
 # touch a real target
 if is_host; then
-    case "${VERB}" in clean-world) ;; *)
-        die "Profile 'host' is the running system — it takes host-maintenance verbs only (clean-world), not '${VERB}'" ;;
+    case "${VERB}" in clean-world|thp) ;; *)
+        die "Profile 'host' is the running system — it takes host-maintenance verbs only (clean-world, thp), not '${VERB}'" ;;
     esac
 fi
 need_board() { is_board || die "'${VERB}' needs a board profile — ${PROF} is native (${PROF_KIND})"; }
@@ -548,6 +556,7 @@ update_qt_lockstep() {
 # --- run lock (xp_lock above): read-only verbs pass, everything else locks its tree
 case "${VERB}" in
     status|log|qlop|qlog|binhost|distcc) ;;
+    thp) ;;                                    # the running kernel's sysfs, no build tree involved
     run|kernel) xp_lock "xlab-${L:-none}" ;;   # the QEMU lab tree, shared by every profile with this xlab target
     *)          xp_lock "$(lock_key)" ;;
 esac
@@ -812,6 +821,21 @@ lock|unlock)
     # there. Instant admin ops — no 'timed' line.
     need_native
     exec "${XSTAGE}" "${T}" "${VERB}" "$@"
+    ;;
+thp)
+    # run-time switch of transparent hugepages on the running kernel; nothing
+    # is written to disk, so the next boot is back at the kernel's default
+    is_host || die "'thp' acts on the running kernel — use 'xp host thp [always|madvise|never]'"
+    thp=/sys/kernel/mm/transparent_hugepage
+    [[ -r ${thp}/enabled ]] || die "This kernel has no transparent hugepage support (${thp}/enabled is missing)"
+    if [[ $# -gt 0 ]]; then
+        case "$1" in always|madvise|never) ;; *) die "thp: '$1' is not one of always, madvise, never" ;; esac
+        [[ ${EUID} -eq 0 ]] || die "thp: switching needs root — sudo xp host thp $1"
+        echo "$1" > "${thp}/enabled" || die "thp: the kernel refused '$1'"
+    fi
+    info "transparent hugepages: $(<"${thp}/enabled")   defrag: $(<"${thp}/defrag")"
+    info "in use now: $(awk '/^AnonHugePages/{printf "%.1f GiB anonymous", $2/1048576}' /proc/meminfo)"
+    exit 0
     ;;
 clean-world)
     # one verb, two real targets: profile 'host' audits the running system's
