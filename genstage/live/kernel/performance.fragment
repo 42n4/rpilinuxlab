@@ -10,7 +10,7 @@
 # keeps the base config's member and drops ours without a word).
 #
 # CPU-agnostic on purpose: -march selection lives in native-cpu.fragment, which
-# only the AMD profiles carry.
+# no profile carries since 2026-11-15 (no measurable gain).
 
 # --- memory ------------------------------------------------------------------
 # Transparent hugepages: absent from defconfig. 'always' because the large
@@ -36,9 +36,13 @@ CONFIG_ZSWAP_COMPRESSOR_DEFAULT_ZSTD=y
 # CONFIG_ZSWAP_COMPRESSOR_DEFAULT_LZO is not set
 CONFIG_ZSMALLOC=y
 # Pressure-stall information: /proc/pressure/*, what systemd-oomd and any
-# "is the box thrashing" check read. Costs nothing measurable when idle.
+# "is the box thrashing" check read. Compiled in but OFF by default: with the
+# accounting on, perf bench sched pipe took 2.4 s instead of 0.92 s (klab VM
+# lab 2026-11-15, confirmed both ways; the cost sits in every sleep/wakeup).
+# Nothing on these images reads it (systemd-oomd is disabled). Boot with
+# psi=1 to turn it on for one boot.
 CONFIG_PSI=y
-# CONFIG_PSI_DEFAULT_DISABLED is not set
+CONFIG_PSI_DEFAULT_DISABLED=y
 
 # --- block layer -------------------------------------------------------------
 # BFQ: ZEN_INTERACTIVE makes it the default for single-queue devices, but the
@@ -66,7 +70,9 @@ CONFIG_TCP_CONG_BBR=m
 CONFIG_NET_SCH_FQ=m
 
 # --- compiler ----------------------------------------------------------------
-# -O3 (zen restores the option mainline removed). Members of one choice.
-CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3=y
-# CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE is not set
+# Plain -O2. -O3 (which zen restores) and -march=native were tried on the host
+# (A/B 734P vs 734Q) and in the klab VM lab, 2026-11-15: nothing beyond noise,
+# so the portable setting stays. Members of one choice.
+CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y
+# CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3 is not set
 # CONFIG_CC_OPTIMIZE_FOR_SIZE is not set

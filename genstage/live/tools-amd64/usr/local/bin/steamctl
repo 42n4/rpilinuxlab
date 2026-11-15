@@ -114,7 +114,7 @@ Helper tools:
   mod key [KEY] | handler | nxm <url>
   mod <cp2077|witcher3|gothic> status | search <words> [-n N] | info <modId> [all]
                             | add <modId>[:fileId] | add <archive> [-n slug] [--plan]
-                            | rm <slug> | list | frameworks [name] | merge | bench [label]
+                            | rm <slug> | list | frameworks [-u] [name] | merge | bench [label]
                             Mods from Nexus (search/info need no account; add needs
                             an API key — `mod key` — and, on a free account, the
                             nxm:// link from the site's Download button, which
@@ -2209,12 +2209,15 @@ gh_release_asset() {
 }
 
 # Framework table per game: key|owner/repo|asset-regex|proof-file|slug
+# redscript is pinned to v0.5.32 (2026-11-15): 1.0.0 rejects Codeware 1.21.4's scripts
+# (OVERRIDE_RETURN_TYPE_MISMATCH on GetInnerNode, psiberx/cp2077-codeware issue #70). Drop the
+# @tag once a Codeware release closes that issue.
 mod_frameworks() {
     case ${MOD_GAME} in
         cp2077) cat <<'EOF'
 red4ext|WopsS/RED4ext|red4ext-[0-9.]+\.zip$|red4ext/RED4ext.dll|fw-red4ext
-cet|maximegmd/CyberEngineTweaks|cet_[0-9.]+\.zip$|bin/x64/plugins/cyber_engine_tweaks.asi|fw-cet
-redscript|jac3km4/redscript|redscript-v[0-9.]+-windows\.zip$|engine/tools/scc_lib.dll|fw-redscript
+cet|maximegmd/CyberEngineTweaks|cet_[0-9._]+\.zip$|bin/x64/plugins/cyber_engine_tweaks.asi|fw-cet
+redscript|jac3km4/redscript@v0.5.32|redscript-v[0-9.]+-windows\.zip$|engine/tools/scc_lib.dll|fw-redscript
 archivexl|psiberx/cp2077-archive-xl|ArchiveXL-[0-9.]+\.zip$|red4ext/plugins/ArchiveXL/ArchiveXL.dll|fw-archivexl
 tweakxl|psiberx/cp2077-tweak-xl|TweakXL-[0-9.]+\.zip$|red4ext/plugins/TweakXL/TweakXL.dll|fw-tweakxl
 codeware|psiberx/cp2077-codeware|Codeware-[0-9.]+\.zip$|red4ext/plugins/Codeware/Codeware.dll|fw-codeware
@@ -2385,15 +2388,23 @@ EOF
             mod_py remove "${MOD_GAME}" "${MOD_ROOT}" "$1" "${MOD_STATE}/${MOD_GAME}" ;;
         list|ls) mod_py list "${MOD_STATE}/${MOD_GAME}" ;;
         frameworks)
-            local only="${1:-}" k repo pat proof slug tag url a
+            # -u|--update: replace an installed framework when upstream's newest tag differs
+            local upd=0; [[ ${1:-} == -u || ${1:-} == --update ]] && { upd=1; shift; }
+            local only="${1:-}" k repo pat proof slug tag url a have
             while IFS='|' read -r k repo pat proof slug; do
                 [[ -z ${only} || ${only} == "${k}" ]] || continue
                 local p="${proof}"; [[ ${p} == /* ]] || p="${MOD_ROOT}/${proof}"
                 if [[ ${pat} == raw ]]; then
                     mkdir -p "${MOD_TOOLS}"; curl -fsSL -o "${p}" "https://raw.githubusercontent.com/${repo}/main/w3scriptmerge.py" && chmod +x "${p}" && info "${k}: fetched → ${p}"; continue
                 fi
-                if [[ -e ${p} && -f ${MOD_STATE}/${MOD_GAME}/${slug}.json ]]; then info "${k}: present ($(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("version","?"))' "${MOD_STATE}/${MOD_GAME}/${slug}.json"))"; continue; fi
+                have=""
+                if [[ -e ${p} && -f ${MOD_STATE}/${MOD_GAME}/${slug}.json ]]; then
+                    have=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("version","?"))' "${MOD_STATE}/${MOD_GAME}/${slug}.json")
+                    (( upd )) || { info "${k}: present (${have})"; continue; }
+                fi
                 IFS=$'\t' read -r tag url < <(gh_release_asset "${repo}" "${pat}") || { warn "${k}: no release asset matching ${pat} on github.com/${repo%@*}"; continue; }
+                if [[ -n ${have} && ${have} == "${tag}" && ${tag} != *latest* ]]; then info "${k}: up to date (${have})"; continue; fi
+                [[ -n ${have} ]] && info "${k}: ${have} → ${tag}"
                 a="${MOD_DL}/${slug}-${tag}.zip"; [[ ${tag} == *latest* ]] && command rm -f "${a}"   # rolling tag: always refetch
                 [[ -f ${a} ]] || { info "${k} ${tag}: ${url##*/}"; curl -fsSL --retry 3 -o "${a}.part" "${url}" && mv -f "${a}.part" "${a}" || { warn "${k}: download failed"; continue; }; }
                 [[ -f ${MOD_STATE}/${MOD_GAME}/${slug}.json ]] && mod_py remove "${MOD_GAME}" "${MOD_ROOT}" "${slug}" "${MOD_STATE}/${MOD_GAME}" >/dev/null
