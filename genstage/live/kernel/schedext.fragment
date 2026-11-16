@@ -1,0 +1,33 @@
+# Kconfig fragment: sched_ext, the BPF-loadable scheduler class (2026-11-15).
+#
+# Profile-scoped: listed in nvidiahard's PROF_LIVE_KFRAGS only, as an experiment
+# on the nvhard host (~/Claude/info/plan-kernel-performance-20261114.md). The
+# gaming distributions build it (CachyOS config; Bazzite and the Steam Deck ship
+# the scx schedulers); the one published desktop test showed little on average
+# FPS and its gain in the 1 % lows. Nothing is measured here yet: move it into
+# performance.fragment for every hard profile only after a host A/B says so.
+#
+# With the option on and no BPF scheduler loaded the kernel schedules exactly as
+# before (EEVDF); a scheduler is loaded by root from userspace (sys-kernel/scx:
+# scx_lavd, scx_flash, scx_bpfland) and the kernel falls back to EEVDF when it
+# exits or stalls. Loading needs CAP_BPF/root; BPF_UNPRIV_DEFAULT_OFF stays.
+#
+# Depends on BPF_SYSCALL && BPF_JIT && DEBUG_INFO_BTF && !SCHED_ALT: the first
+# three come from live.fragment (BTF is kept alive there despite RANDSTRUCT, see
+# its comment). If BTF is ever dropped by olddefconfig, this symbol goes with it
+# silently, so a queue must check the final .config.
+CONFIG_SCHED_CLASS_EXT=y
+
+# The function tracer is what makes the schedulers loadable at all. Every scx
+# scheduler also attaches fentry/tracing BPF programs, and a BPF trampoline is
+# patched over the 5-byte NOP that only FUNCTION_TRACER (-mfentry) puts at each
+# function entry. Without it the kernel finds other bytes there and refuses:
+#   Error: Failed to attach non-struct_ops BPF programs ... Device or resource busy
+# (__bpf_arch_text_poke -> -EBUSY; measured on nvhard 2026-11-16, kernel #10:
+# every scx_* failed, and systemd's own LSM BPF program 'restrict_filesystems'
+# fails the same way on every kernel built without it). sys-kernel/scx only
+# checks ~FTRACE, which is not enough. DYNAMIC_FTRACE defaults to y with it and
+# brings DYNAMIC_FTRACE_WITH_DIRECT_CALLS. Cost: ftrace's function hooks exist
+# for root (tracefs); the NOPs themselves are free.
+CONFIG_FUNCTION_TRACER=y
+CONFIG_DYNAMIC_FTRACE=y

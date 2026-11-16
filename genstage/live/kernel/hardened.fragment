@@ -130,6 +130,19 @@ CONFIG_SECURITY_LANDLOCK=y
 # it to n, and systemd's pre-merge check flags the miss (it wants it for
 # RestrictNetworkInterfaces= and friends)
 CONFIG_BPF_LSM=y
+# BPF_LSM alone lets nothing attach. An LSM (or fentry) BPF program is attached
+# through a BPF trampoline patched over the 5-byte NOP that only FUNCTION_TRACER
+# (-mfentry) puts at each function entry; without it the kernel finds other
+# bytes there and __bpf_arch_text_poke returns -EBUSY. Measured on nvhard
+# 2026-11-16: every kernel built without the tracer logged systemd's
+# "bpf-restrict-fs: Failed to link program restrict_filesystems", so
+# RestrictFileSystems= in a unit was silently not enforced; with the tracer
+# (kernel #12) it reads "LSM BPF program attached". DYNAMIC_FTRACE defaults to y
+# with it and brings DYNAMIC_FTRACE_WITH_DIRECT_CALLS. Cost: ftrace's function
+# hooks exist for root (tracefs, itself behind lockdown); the NOPs are free.
+# schedext.fragment repeats both symbols for the same reason (scx schedulers).
+CONFIG_FUNCTION_TRACER=y
+CONFIG_DYNAMIC_FTRACE=y
 CONFIG_BPF_UNPRIV_DEFAULT_OFF=y
 
 # --- legacy interfaces that are pure attack surface -------------------------
