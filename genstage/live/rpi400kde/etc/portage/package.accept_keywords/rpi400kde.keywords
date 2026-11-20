@@ -155,6 +155,7 @@ media-libs/webrtc-audio-processing:2 ~arm64
 media-libs/zita-convolver ~arm64
 # CamillaDSP upstream aarch64 binary (::pwr, 2026-10-12)
 media-sound/camilladsp-bin ~arm64
+dev-util/claude-code ~arm64
 media-libs/libbs2b ~arm64
 media-libs/libsoundtouch ~arm64
 dev-qt/qtgraphs ~arm64
