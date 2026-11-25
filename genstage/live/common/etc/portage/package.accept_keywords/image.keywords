@@ -31,6 +31,15 @@ dev-python/docstring-parser **
 dev-util/catalyst
 app-misc/qwen-code
 dev-util/claude-code::pwr
+# Agent-configuration and skill checkers (::pwr, 2026-11-25), listed in
+# amdkdehard; the two dev-python entries are dependencies of skillspector-static.
+dev-util/ctxlint::pwr
+dev-util/ctxlint-yaw::pwr
+dev-util/agentshield::pwr
+dev-util/skillspector-static::pwr
+dev-util/skil-lock::pwr
+dev-python/pywhatwgurl::pwr
+dev-python/tree-sitter-typescript::pwr
 
 # Testing-only DEPENDENCIES, found by resolving the whole graph rather than by
 # hitting them one failed run at a time. The host's list could not cover these:
