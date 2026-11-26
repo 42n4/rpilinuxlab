@@ -1,0 +1,5 @@
+# Let group `usb` power-cycle ports of the KVM-side Realtek hubs (RTS5411 USB2 0bda:5411 + its USB3
+# peer 0bda:0411) via the kernel's port "disable" files. Without this, uhubctl falls back to libusb,
+# and on Linux >= 6.0 the kernel powers the port straight back on (no real power cut).
+# Used by `mictl reset` (Elgato Wave:3 touch-mute only clears on a real power cut).
+ACTION=="add", SUBSYSTEM=="usb", DRIVER=="hub", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="5411|0411", RUN+="/bin/sh -c 'chgrp usb $sys$devpath/*-port*/disable; chmod g+w $sys$devpath/*-port*/disable'"
