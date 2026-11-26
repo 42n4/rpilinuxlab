@@ -1,0 +1,45 @@
+# Qt stays at 6.11.3 until dev-python/pyside and dev-qt/qtwebengine have a release for the newer Qt.
+# Qt 6.12.1 (~amd64, accepted by host.keywords) arrived while pyside-6.11.3 pins =qtbase-6.11.3* and
+# pyside-6.12.0-r1 pins 6.12.0*: the update then pulls two qtbase versions into slot 6 and the resolver
+# gives up after backtracking ("slot conflict", dev-qt/qtbase).
+# Every module with a 6.12 release is listed: masking qtbase alone leaves the others at 6.12.1 asking
+# for the masked qtbase. Regenerate the list from the tree when lifting or extending:
+#   ls /var/db/repos/gentoo/dev-qt/*/*-6.12.[0-9]*.ebuild | cut -d/ -f7 | sort -u
+# Lift when a pyside release matches the newest keyworded qtbase.
+>=dev-qt/qt3d-6.12
+>=dev-qt/qt5compat-6.12
+>=dev-qt/qtbase-6.12
+>=dev-qt/qtcanvaspainter-6.12
+>=dev-qt/qtcharts-6.12
+>=dev-qt/qtconnectivity-6.12
+>=dev-qt/qtdeclarative-6.12
+>=dev-qt/qt-docs-6.12
+>=dev-qt/qtgraphs-6.12
+>=dev-qt/qthttpserver-6.12
+>=dev-qt/qtimageformats-6.12
+>=dev-qt/qtlanguageserver-6.12
+>=dev-qt/qtlocation-6.12
+>=dev-qt/qtmultimedia-6.12
+>=dev-qt/qtnetworkauth-6.12
+>=dev-qt/qtpositioning-6.12
+>=dev-qt/qtquick3d-6.12
+>=dev-qt/qtquicktimeline-6.12
+>=dev-qt/qtremoteobjects-6.12
+>=dev-qt/qtscxml-6.12
+>=dev-qt/qtsensors-6.12
+>=dev-qt/qtserialbus-6.12
+>=dev-qt/qtserialport-6.12
+>=dev-qt/qtshadertools-6.12
+>=dev-qt/qtspeech-6.12
+>=dev-qt/qtsvg-6.12
+>=dev-qt/qttasktree-6.12
+>=dev-qt/qttools-6.12
+>=dev-qt/qttranslations-6.12
+>=dev-qt/qtvirtualkeyboard-6.12
+>=dev-qt/qtwayland-6.12
+>=dev-qt/qtwebchannel-6.12
+>=dev-qt/qtwebsockets-6.12
+>=dev-qt/qtwebview-6.12
+# qtwebengine switched to its own version line (6.140.0) built for the newer Qt; without this line every
+# run prints "updates have been skipped due to a dependency conflict" for it.
+>=dev-qt/qtwebengine-6.12
