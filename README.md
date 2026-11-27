@@ -33,7 +33,7 @@ root. `xp` exports these together with `XP_LAB_DIR`, so they reach
 ```
 xp profiles                      # rpi3 rpi400 rpi400kde rpi400hard rpi400openrc
                                  #   zero zero2w | amd64 amdkde amdkdehard
-                                 #   nvidiahard intelhard intelgnome
+                                 #   nvidiahard intelhard corehard ryzenhard intelgnome
 sudo xp rpi400kde setup          # xarm toolchain + xstage catalyst dirs
      xp rpi400kde seed           # stage3 in the profile's flavour -> dl/,
                                  #   sha256 + releng GPG verified (no root)
@@ -56,7 +56,7 @@ sudo xp rpi400kde pkgs           # PROF_PKGS into the rootfs (cross-emerge).
                                  #   names one it cannot find
 sudo xp rpi400kde rpi            # Pi payload: kernel8.img, start*.elf, DTBs
 sudo xp rpi400kde image          # conf + configure + sd.img (FAT32 boot + ext4)
-     xp rpi400kde gate           # qemu boot gate (raspi3b / raspi4b per board)
+     xp rpi400kde gate           # qemu boot gate (raspi3b / raspi4b per board); stops itself: PASS/FAIL/TIMEOUT
 sudo xp rpi400kde sd /dev/sdX    # dd to the card                     [confirm]
 sudo xp rpi400kde enter          # aarch64 shell in the rootfs (qemu-user)
      xp rpi400kde log            # watch a long build (also: log emerge, qlop)
@@ -68,6 +68,30 @@ replaces that argument — but **only for commands that do not go through
 `sudo xp build` after an export loses it and stops with "No profile" (it
 refuses rather than guessing, so nothing runs against the wrong tree). Either
 spell the profile out as above, or use `sudo -E xp build`.
+
+One verb per tree at a time: every writing verb holds an `flock` on
+`<build dir>/.xp-locks/<tree>.lock` for as long as it runs — the fd is
+inherited by the chroot and by emerge, and the kernel releases it with the
+last process, so it cannot go stale. A second writing verb on the same tree
+is refused and told who holds it (`xp amdkdehard pkgs  pid … since …`);
+different trees are independent, and `status`, `log`, `qlop`, `binhost`,
+`distcc` never lock. `XP_NOLOCK=1` skips it when you know the two verbs touch
+different files. Only `xp` locks — a direct `xstage`/`xarm` call does not.
+
+Chroot sessions run in their own namespaces: every amd64 verb that enters the
+image (`conf`, `pkgs`, `restrict-run`, `configure`, `livekernel`, `rmkernel`,
+`squash`, `live`, `enter`, `emerge`) and the board verbs `xarm chroot` / `1by1`
+re-execute themselves once under `unshare --mount --uts --ipc`. The binds
+(`/proc`, `/sys`, `/dev`, ccache, distfiles, build dir, binpkgs) exist only for
+that session and vanish with its last process, so a kill or a closed terminal
+cannot leave mounts on the host; the session's hostname is the image's, so a
+kernel built there says `root@<image>` instead of the build machine's name.
+On the host `findmnt` shows nothing while a session runs — look inside with
+`sudo nsenter -m -t <pid> findmnt -R <rootfs>` (`xp <profile> status` as root
+prints the pids). A second session on the same tree is refused by pid, not by
+mount. `XSTAGE_NO_NS=1` / `XARM_NO_NS=1` switch the namespaces off. A process
+that survives a `kill -9` of xstage (an orphaned emerge) keeps its namespace
+alive until it ends; it is listed by the refusal message.
 
 `build` unpacks the newest `dl/stage3-arm64-<flavour>-*.tar.xz`, so the block
 above is the whole path from nothing to a bootable card. Building the stage3
@@ -413,6 +437,6 @@ Free Software Foundation, either **version 2 of the License, or (at your
 option) any later version** (GPL-2.0-or-later). See [LICENSE](LICENSE)
 for the full text of version 2.
 
-The scripts under `genstage/live/tools/` are mirrored from the
+The scripts under `genstage/live/tools/` and `genstage/live/tools-amd64/` are mirrored from the
 [gentools](https://github.com/pwasiewi/gentools) repository and carry the
 same GPL-2.0-or-later license.

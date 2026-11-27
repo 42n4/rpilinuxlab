@@ -68,7 +68,7 @@
 #                    -g plan file for review, -a apply it     [root for -i/-a]
 #   configure        hostname, root password, live user + autologin, sshd,
 #                    default runlevel, motd  [root]
-#   kernel           genkernel with CDROOT=1 inside the chroot; the .config is
+#   kernel           genkernel inside the chroot (CDROOT=0); the .config is
 #                    built by merging live/kernel/*.fragment onto a base
 #                    (XSTAGE_LIVE_KCONFIG_BASE: defconfig | host | PATH),
 #                    re-merged here even if 'pkgs' already staged it        [root]
@@ -87,7 +87,7 @@
 #                    partitions untouched). --wipe or no ESP+LIVE layout:
 #                    wipes the WHOLE stick — build-usb repartitions, installs
 #                    GRUB, then the same copies                    [root,confirm]
-#   live-status      rootfs / kernel / squashfs / iso state
+#   live-status [--du]  rootfs / kernel / squashfs / iso state (--du: walk the rootfs for its size, slow)
 #   live-clean       rm the profile's live build tree                    [confirm]
 #
 # Subcommands (tiny):
@@ -118,7 +118,12 @@
 #                    on the display                                      [root]
 #   run-rpi          boot sd.img in qemu (raspi4b or raspi3b, matching the
 #                    board the image was built for): boot GATE only — output
-#                    on ttyAMA1, but qemu can't inject input into it
+#                    on ttyAMA1, but qemu can't inject input into it. Stops by
+#                    itself: PASS on the init's success marker (systemd default
+#                    target / OpenRC 'local'), FAIL on panic/emergency, else
+#                    XSTAGE_GATE_TIMEOUT (900 s); console log in the build dir.
+#                    XSTAGE_GATE_PASS='<ERE>' overrides the marker,
+#                    XSTAGE_GATE_HOLD=1 = watch-and-quit (Ctrl-A X) as before
 #   sd DEV           dd sd.img onto a real SD card (/dev/sdX or
 #                    /dev/mmcblkN, removable-only safety)        [root,confirm]
 #   clean            rm ../build/tinyroot                            [confirm]
@@ -337,6 +342,15 @@ LIVE_MAKECONF_EXTRA="${XSTAGE_LIVE_MAKECONF_EXTRA:-}"
 LIVE_UPDATE_FIRST="${XSTAGE_LIVE_UPDATE_FIRST:-yes}"
 LIVE_PYTHON_SINGLE_TARGET="${XSTAGE_LIVE_PYTHON_SINGLE_TARGET:-}"
 LIVE_PORTAGE_PROFILE="${XSTAGE_LIVE_PORTAGE_PROFILE:-}"
+# Groups whose membership alone equals root, or a root password, so a HARDENED
+# image keeps its default user out of them (2026-10-15): disk = raw block
+# devices, kmem/mem = kernel and physical memory (lockdown ships 'none'),
+# shadow = the password hashes, sys and tty, and SystemTap's three groups,
+# which compile and load kernel modules. Non-hardened images keep the
+# "every group" rule of 2026-08-06. NOT in the list on purpose, user decision
+# pending: docker (also root, but the AI stack calls it as the user) and input
+# (reads every keyboard, but Steam/uinput and hidraw tools may need it).
+XSTAGE_ROOT_EQUIV_GROUPS="${XSTAGE_ROOT_EQUIV_GROUPS-disk kmem mem sys shadow tty stapdev stapsys stapusr}"
 # the kernel sources /usr/src/linux/.config is built against; a profile whose
 # package list ships another sources package (zen-sources, say) should name it
 # here too, or the image ends up carrying both trees
@@ -364,8 +378,9 @@ LIVE_RC="${XSTAGE_LIVE_RC:-openrc}"
 INIT_PATH="${LIVE_INIT}"
 RC_SYSTEM="${LIVE_RC}"
 LIVE_FLAVOR_NAME="${XSTAGE_STAGE3_FLAVOR:-${FLAVOR}}"
-# genkernel's CDROOT initrd finds the media by the /livecd marker, then
-# loop-mounts /livecd.squashfs as the real root — hence no root=<device> here.
+# 'cdroot' switches genkernel's initrd into CD mode: it finds the media by the
+# /livecd marker, then loop-mounts /livecd.squashfs as the real root —
+# hence no root=<device> here.
 # real_init is what the initrd execs after the switch: /sbin/init on OpenRC,
 # /usr/lib/systemd/systemd on a systemd flavour.
 LIVE_APPEND="${XSTAGE_LIVE_APPEND:-root=/dev/ram0 init=/linuxrc real_init=${LIVE_INIT} dokeymap looptype=squashfs loop=/livecd.squashfs cdroot}"
@@ -529,7 +544,36 @@ ALL_TARGETS=(amd64 tiny arm64)
 die()     { echo "❌  $*" >&2; exit 1; }
 info()    { echo ">>>  $*"; }
 warn()    { echo "⚠️   $*" >&2; }
-confirm() { read -r -p "$1 [yes/NO]: " ans; [[ "$ans" == "yes" ]] || die "Aborted."; }
+confirm() { read -r -p "$1 [yes/NO]: " ans || die "Aborted (no answer on stdin)."; [[ "$ans" == "yes" ]] || die "Aborted."; }
+# binrepos.conf must carry 'verify-signature = true' per section; asserted in
+# conf and AGAIN after the overlay rsync, which may bring its own portage files
+live_assert_binrepos_sig() {
+    local brc
+    for brc in "${LIVE_ROOT}"/etc/portage/binrepos.conf/*.conf \
+               "${LIVE_ROOT}"/etc/portage/binrepos.conf; do
+        [[ -f ${brc} ]] || continue
+        # 'if !' and not 'grep -q ... && continue': under set -e the
+        # short-circuited AND-list is itself the statement's exit status,
+        # so a file that legitimately lacks the line would abort 'conf'
+        if ! grep -q '^[[:space:]]*verify-signature' "${brc}"; then
+            info "binrepos.conf: asserting 'verify-signature = true' in ${brc#"${LIVE_ROOT}"}"
+            printf 'verify-signature = true\n' >> "${brc}"
+        fi
+    done
+}
+# Refuse to rm -rf a tree that still has mounts under it. live_chroot rbinds
+# /dev and /sys and bind-mounts the host's distfiles, binpkgs, builddir and
+# ccache READ-WRITE into the rootfs; after a SIGKILL or a crash those stay,
+# and GNU rm -rf (no --one-file-system) would delete straight through them
+# into the host (audit 2026-10-11). Every destructive clean goes through here.
+no_mounts_under() {
+    local d="${1%/}" m
+    [[ -n ${d} && ${d} != / ]] || die "no_mounts_under: refusing '${1}'"
+    [[ -d ${d} ]] || return 0
+    m=$(findmnt -rn -o TARGET | awk -v d="${d}/" 'index($0, d) == 1 || $0 == substr(d, 1, length(d) - 1)')
+    [[ -z ${m} ]] || die "mounts still active under ${d} — umount them first (findmnt -R ${d}):
+${m}"
+}
 help()    { sed -n '2,/^set /p' "$0" | grep '^#' | sed 's/^# \?//'; }
 
 need_root()     { [[ $EUID -eq 0 ]] || die "Root required: sudo $0 ${TGT:-} ${CMD:-}"; }
@@ -651,14 +695,17 @@ cmd_seed() {
         fi
         info "Verifying releng GPG signature"
         local gtmp; gtmp=$(mktemp -d)
-        GNUPGHOME="${gtmp}" gpg -q --import "${keyring}" 2>/dev/null
+        GNUPGHOME="${gtmp}" gpg -q --import "${keyring}" 2>/dev/null ||
+            { command rm -rf "${gtmp}"; die "could not import ${keyring} — gpg broken?"; }
         GNUPGHOME="${gtmp}" gpg -q --trust-model always \
             --verify "${DL_DIR}/${tarball}.asc" "${DL_DIR}/${tarball}" 2>/dev/null ||
             { command rm -rf "${gtmp}"; die "GPG verification FAILED on ${tarball}"; }
         command rm -rf "${gtmp}"
         info "GPG signature good (Gentoo Release Engineering)"
+    elif [[ ${XSTAGE_ALLOW_UNVERIFIED:-} == 1 ]]; then
+        warn "No ${keyring} — stage3 origin NOT verified (XSTAGE_ALLOW_UNVERIFIED=1)"
     else
-        warn "No ${keyring} — stage3 origin NOT verified: emerge -av sec-keys/openpgp-keys-gentoo-release"
+        die "No ${keyring} — the stage3's origin cannot be verified (the .sha256 rides the same mirror). Fix: emerge -av sec-keys/openpgp-keys-gentoo-release; or XSTAGE_ALLOW_UNVERIFIED=1 to accept the mirror's sha256 alone"
     fi
 
     # without the catalyst dirs the seed still serves 'arm64 unpack' from dl/
@@ -963,6 +1010,7 @@ cmd_verify() {
     [[ -n ${tarball} ]] || die "No built stage3 in builds/${REL_TYPE} — run: sudo $0 ${TGT:-amd64} all"
     local vdir="${STOREDIR}/tmp/verify"
     info "Unpacking $(basename "${tarball}") into ${vdir}"
+    no_mounts_under "${vdir}"
     command rm -rf "${vdir}"
     mkdir -p "${vdir}"
     tar xpf "${tarball}" -C "${vdir}" --xattrs-include='*.*' --numeric-owner
@@ -977,10 +1025,11 @@ cmd_verify() {
     # and /proc — without them 'emerge --version' prints warnings and fails
     # while the chroot's exit status still comes from the last command
     mount -t proc none "${vdir}/proc"
-    mount --rbind /dev "${vdir}/dev"
-    mount --make-rslave "${vdir}/dev"
+    # one mount process: a deferred Ctrl-C can no longer land between the
+    # bind and the propagation change (2026-11-08, see live_chroot_umount)
+    mount --rbind --make-rslave /dev "${vdir}/dev"
     # shellcheck disable=SC2064 — expand ${vdir} now, not at trap time
-    local _vdir_umount="umount -R '${vdir}/dev' 2>/dev/null || true; umount '${vdir}/proc' 2>/dev/null || true"
+    local _vdir_umount="mount --make-rprivate '${vdir}/dev' 2>/dev/null; umount -R '${vdir}/dev' 2>/dev/null || true; umount '${vdir}/proc' 2>/dev/null || true"
     trap "${_vdir_umount}" EXIT
     trap "${_vdir_umount}; exit 130" INT
     trap "${_vdir_umount}; exit 143" TERM
@@ -991,9 +1040,10 @@ cmd_verify() {
         emerge --version
         head -1 /etc/os-release' ||
         die "Chroot smoke test failed"
+    mount --make-rprivate "${vdir}/dev" 2>/dev/null
     umount -R "${vdir}/dev"
     umount "${vdir}/proc"
-    trap - EXIT INT TERM
+    trap - EXIT HUP INT TERM
     info "OK: tarball $(du -h "${tarball}" | cut -f1), unpacked $(du -sh "${vdir}" | cut -f1)"
 }
 
@@ -1014,10 +1064,12 @@ cmd_clean_amd64() {
     local all="${1:-}"
     if [[ ${all} == all ]]; then
         confirm "Remove catalyst tmp/, built stages, snapshots and state (seeds + git repos kept)?"
+        no_mounts_under "${STOREDIR}/tmp"
         command rm -rf "${STOREDIR}/tmp" "${STOREDIR}/builds/${REL_TYPE}" \
                        "${STOREDIR}/snapshots" "${STATE}" "${SPECDIR}"
     else
         confirm "Remove catalyst tmp/ (scratch chroots)?"
+        no_mounts_under "${STOREDIR}/tmp"
         command rm -rf "${STOREDIR}/tmp"
     fi
     info "Cleaned."
@@ -1082,7 +1134,8 @@ live_distfiles_seed() {
         [[ -f ${f} ]] || continue
         case "${f}" in *.md|*.txt) continue ;; esac
         [[ -e ${LIVE_DISTFILES_DIR}/${f##*/} ]] && continue
-        cp -n "${f}" "${LIVE_DISTFILES_DIR}/" && n=$((n + 1))
+        cp -n "${f}" "${LIVE_DISTFILES_DIR}/" || die "seed copy failed: ${f} -> ${LIVE_DISTFILES_DIR} (disk full? permissions?)"
+        n=$((n + 1))
     done
     [[ ${n} -eq 0 ]] || info "Seeded ${n} fetch-restricted distfile(s) from ${store}"
 }
@@ -1155,46 +1208,165 @@ live_ccache_mount() {
 live_chroot() {  # live_chroot <label>  (script on stdin)
     local label="$1"
     [[ -x ${LIVE_ROOT}/bin/bash ]] || die "No rootfs — run: sudo $0 ${TGT:-amd64} unpack"
-    command cp -f /etc/resolv.conf "${LIVE_ROOT}/etc/resolv.conf"
-    mount -t proc  none "${LIVE_ROOT}/proc"
-    mount --rbind /sys  "${LIVE_ROOT}/sys";  mount --make-rslave "${LIVE_ROOT}/sys"
-    mount --rbind /dev  "${LIVE_ROOT}/dev";  mount --make-rslave "${LIVE_ROOT}/dev"
-    live_ccache_mount
-    live_distfiles_mount
-    live_builddir_mount
-    live_binpkgs_mount
     # shellcheck disable=SC2064 — expand ${LIVE_ROOT} now, not at trap time
     # INT/TERM must EXIT, not merely unmount. Bash defers a trap until the
     # foreground command returns, so a Ctrl-C during a long step first killed
     # the running emerge and then ran a handler that only unmounted and let
     # the script walk on to the next step - indistinguishable, from the
     # terminal, from "Ctrl-C does nothing". live_chroot_umount is idempotent,
-    # so the EXIT trap firing again after these is harmless.
+    # so the EXIT trap firing again after these is harmless. Armed BEFORE the
+    # first mount: a failing bind below (set -e) must still unwind the ones
+    # that already succeeded.
+    live_chroot_mounted "${LIVE_ROOT}"
+    # No HUP trap on purpose: bash defers a trap until the foreground command
+    # returns, and for 'enter' that is the interactive shell - a closed terminal
+    # then left xstage waiting until sudo killed it, with no cleanup at all
+    # (2026-10-19). Bash's default SIGHUP handling runs the EXIT trap at once;
+    # live_chroot_reap inside it ends what the session left behind.
     trap "live_chroot_umount '${LIVE_ROOT}'" EXIT
     trap "live_chroot_umount '${LIVE_ROOT}'; exit 130" INT
     trap "live_chroot_umount '${LIVE_ROOT}'; exit 143" TERM
+    command cp -f /etc/resolv.conf "${LIVE_ROOT}/etc/resolv.conf"
+    # a leak from an interrupted session (binds, no /proc - the guard above
+    # passed) must go BEFORE the new binds: a bind stacked on a leaked
+    # SHARED one propagates a copy of the whole tree onto the host's /sys
+    # peers (measured: +4 stacked /sys per conf, 2026-11-08)
+    live_chroot_umount "${LIVE_ROOT}"
+    mount -t proc  none "${LIVE_ROOT}/proc"
+    # bind + propagation in ONE mount process: bash delivers a deferred Ctrl-C
+    # between two commands, and a tree left as a shared peer of the host's
+    # /sys cannot be unmounted while the host's cgroup2 is busy (2026-11-08)
+    mount --rbind --make-rslave /sys "${LIVE_ROOT}/sys"
+    mount --rbind --make-rslave /dev "${LIVE_ROOT}/dev"
+    live_ccache_mount
+    live_distfiles_mount
+    live_builddir_mount
+    live_binpkgs_mount
     local rc=0
     # LC_ALL=C.UTF-8: the host's pl_PL.utf8 is not generated inside a stage3,
     # and every step otherwise opens with two setlocale warnings
-    LC_ALL=C.UTF-8 chroot "${LIVE_ROOT}" /bin/bash -s <<-EOF || rc=$?
+    # env -i: the caller's exported ROOT/USE/MAKEOPTS/EMERGE_DEFAULT_OPTS must
+    # not leak into the image build; proxies are passed through on purpose
+    chroot "${LIVE_ROOT}" /usr/bin/env -i HOME=/root TERM="${TERM:-dumb}" LC_ALL=C.UTF-8 \
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        ${http_proxy:+http_proxy="${http_proxy}"} ${https_proxy:+https_proxy="${https_proxy}"} \
+        ${ftp_proxy:+ftp_proxy="${ftp_proxy}"} ${no_proxy:+no_proxy="${no_proxy}"} \
+        /bin/bash -s <<-EOF || rc=$?
 	set -eo pipefail
 	source /etc/profile >/dev/null 2>&1 || true
 	$(cat)
 	EOF
     live_chroot_umount "${LIVE_ROOT}"
-    trap - EXIT INT TERM
+    trap - EXIT HUP INT TERM
     [[ ${rc} -eq 0 ]] || die "chroot step '${label}' failed (exit ${rc})"
 }
 
+# live_chroot_reap ROOT — end what this session left running inside ROOT.
+# Closing the terminal (SIGHUP) runs the EXIT trap, but the interactive shell
+# of 'enter' and whatever it started survive as orphans inside the image
+# (seen 2026-10-19: bash + its job outlived xstage); one holding a file under a
+# bind mount makes that umount fail. Only processes whose root IS this image
+# and whose session is OURS are touched — another session on the same tree
+# (XP_NOLOCK, a direct xstage call) has a different SID and is left alone.
+live_chroot_reap() {
+    local r="$1" sid p pids=""
+    sid=$(ps -o sid= -p $$ 2>/dev/null | tr -d ' ')
+    [[ -n ${sid} ]] || return 0
+    for p in /proc/[0-9]*; do
+        p=${p#/proc/}
+        [[ ${p} == "$$" ]] && continue
+        [[ $(readlink "/proc/${p}/root" 2>/dev/null) == "${r}" ]] || continue
+        [[ $(ps -o sid= -p "${p}" 2>/dev/null | tr -d ' ') == "${sid}" ]] || continue
+        pids+=" ${p}"
+    done
+    [[ -n ${pids} ]] || return 0
+    warn "ending processes this session left inside the image:${pids}"
+    kill -TERM ${pids} 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+        sleep 1
+        kill -0 ${pids} 2>/dev/null || return 0
+    done
+    kill -KILL ${pids} 2>/dev/null || true
+    sleep 1
+}
+
+# live_chroot_mounted ROOT — refuse to mount over a session that is already
+# there: bind mounts stack, and the first session to exit would then unmount
+# /proc, /dev and /sys under the other one. Called BEFORE the traps are armed,
+# so dying here unmounts nothing.
+live_chroot_mounted() {
+    if mountpoint -q "$1/proc" 2>/dev/null; then
+        die "${1} already has /proc mounted — another session is inside the image, or one leaked its mounts.
+    Running: for p in /proc/[0-9]*; do [ \"\$(readlink \$p/root)\" = \"$1\" ] && echo \${p#/proc/}; done
+    Leaked (nothing running): findmnt -R $1 ; then umount -R the listed targets"
+    fi
+    # A session in its own mount namespace (the default since 2026-11-13) is
+    # invisible to the check above: its /proc bind does not exist here. Look
+    # for processes rooted in the image from ANOTHER mount namespace instead.
+    # Leftovers of this session's earlier steps share our namespace and pass.
+    local pids; pids=$(live_foreign_sessions "$1")
+    [[ -n ${pids} ]] || return 0
+    if [[ -n ${XP_NOLOCK:-} ]]; then
+        warn "XP_NOLOCK: another session is inside ${1} (pids:${pids}) — two writers corrupt a tree"
+        return 0
+    fi
+    die "another session is inside ${1} (pids:${pids}), in its own mount namespace — wait for it.
+    Its mounts: nsenter -m -t <pid> findmnt -R $1"
+}
+
+# live_foreign_sessions ROOT - pids rooted in ROOT whose mount namespace is
+# not ours (needs root to read other users' /proc/PID/root; empty otherwise)
+live_foreign_sessions() {
+    local r="$1" p mine out=""
+    mine=$(readlink /proc/self/ns/mnt 2>/dev/null) || return 0
+    for p in /proc/[0-9]*; do
+        [[ $(readlink "${p}/root" 2>/dev/null) == "${r}" ]] || continue
+        [[ $(readlink "${p}/ns/mnt" 2>/dev/null) == "${mine}" ]] && continue
+        out+=" ${p#/proc/}"
+    done
+    echo "${out}"
+}
+
+# live_mount_count PATH - mount instances at PATH or below it (stacked ones
+# count separately; findmnt -R shows only the top instance of a path)
+live_mount_count() {
+    awk -v p="$1" '$5 == p || index($5, p "/") == 1' /proc/self/mountinfo | wc -l
+}
+
 live_chroot_umount() {
-    local r="$1"
-    umount "${r}${LIVE_CCACHE_MNT}" 2>/dev/null || true
-    umount "${r}${LIVE_DISTFILES_MNT}" 2>/dev/null || true
-    umount "${r}${LIVE_BUILDDIR_MNT}" 2>/dev/null || true
-    umount "${r}${LIVE_BINPKGS_MNT}" 2>/dev/null || true
-    umount -R "${r}/dev"  2>/dev/null || true
-    umount -R "${r}/sys"  2>/dev/null || true
-    umount    "${r}/proc" 2>/dev/null || true
+    # Idempotent, and no longer silent: an 'umount || true' left two binds
+    # (binpkgs, ccache) under amdkdehard after an interrupted 'enter'
+    # (2026-10-19) and nothing said so — du then counted 166 GB of host cache
+    # as rootfs. Each target is unmounted until it is no longer a mount point
+    # (stacked binds from an earlier leak included); what stays mounted (busy)
+    # is reported, with the command to finish the job once it is free.
+    local r="$1" t left=""
+    live_chroot_reap "${r}"
+    for t in "${LIVE_CCACHE_MNT}" "${LIVE_DISTFILES_MNT}" "${LIVE_BUILDDIR_MNT}" "${LIVE_BINPKGS_MNT}"; do
+        while mountpoint -q "${r}${t}" 2>/dev/null; do
+            umount "${r}${t}" 2>/dev/null || { left+=" ${r}${t}"; break; }
+        done
+    done
+    local n
+    for t in /dev /sys; do
+        while mountpoint -q "${r}${t}" 2>/dev/null; do
+            # a bind left SHARED (Ctrl-C before --make-rslave, 2026-11-08) makes
+            # umount propagate to the host's busy cgroup2 -> EBUSY forever;
+            # private first: no effect on the host, the image copy then goes.
+            # --make-rprivate reaches only the TOP instance at the path: with a
+            # fresh bind stacked on a leaked one, umount -R drops the top and
+            # fails on the shared tree below - keep looping while instances go.
+            n=$(live_mount_count "${r}${t}")
+            mount --make-rprivate "${r}${t}" 2>/dev/null
+            umount -R "${r}${t}" 2>/dev/null && continue
+            (( $(live_mount_count "${r}${t}") < n )) && continue
+            left+=" ${r}${t}"; break
+        done
+    done
+    while mountpoint -q "${r}/proc" 2>/dev/null; do
+        umount "${r}/proc" 2>/dev/null || { left+=" ${r}/proc"; break; }
+    done
+    [[ -z ${left} ]] || warn "still mounted under the image (busy):${left} — when free: umount -R <path>"
 }
 
 cmd_live_unpack() {
@@ -1219,6 +1391,7 @@ cmd_live_unpack() {
     fi
     if [[ -d ${LIVE_ROOT} && -n $(ls -A "${LIVE_ROOT}" 2>/dev/null) ]]; then
         confirm "Remove existing ${LIVE_ROOT} and re-unpack?"
+        no_mounts_under "${LIVE_ROOT}"
         command rm -rf "${LIVE_ROOT}"
     fi
     mkdir -p "${LIVE_ROOT}"
@@ -1385,6 +1558,11 @@ cmd_live_conf() {
         {
             echo "[${r}]"
             echo "location = /var/db/repos/${r}"
+            # ::pwr is the personal override: with no priority both overlays
+            # are priority=None and for a cat/pkg-version present in both
+            # ::stuff wins (xrt-999999::stuff picked over ::pwr, host 2026-11-10).
+            # Restored here so every image copy and the installed host agree.
+            [[ ${r} == pwr ]] && echo "priority = 100"
             if [[ -n ${rurl} ]]; then
                 echo "sync-type = git"
                 echo "sync-uri = ${rurl}"
@@ -1425,18 +1603,7 @@ cmd_live_conf() {
         # from a remote binhost unverified and says nothing about it. Appended
         # at the end of the file, which is the last (and by convention only)
         # section it declares.
-        local brc
-        for brc in "${LIVE_ROOT}"/etc/portage/binrepos.conf/*.conf \
-                   "${LIVE_ROOT}"/etc/portage/binrepos.conf; do
-            [[ -f ${brc} ]] || continue
-            # 'if !' and not 'grep -q ... && continue': under set -e the
-            # short-circuited AND-list is itself the statement's exit status,
-            # so a file that legitimately lacks the line would abort 'conf'
-            if ! grep -q '^[[:space:]]*verify-signature' "${brc}"; then
-                info "binrepos.conf: asserting 'verify-signature = true' in ${brc#"${LIVE_ROOT}"}"
-                printf 'verify-signature = true\n' >> "${brc}"
-            fi
-        done
+        live_assert_binrepos_sig
     fi
 
     if [[ -n ${LIVE_PORTAGE_PROFILE} ]]; then
@@ -1480,6 +1647,9 @@ cmd_live_conf() {
                 warn "PROF_LIVE_OVERLAY_DIR names '${ovdir}' but ${ov} does not exist"
             fi
         done
+        # an overlay may carry its own binrepos.conf — re-assert what conf
+        # pinned above (ordering finding, audit 2026-10-11)
+        if [[ " ${LIVE_FEATURES} " == *getbinpkg* ]]; then live_assert_binrepos_sig; fi
     fi
     # FEATURES=ccache does nothing without the masquerade symlinks in
     # /usr/lib/ccache/bin, and those come from dev-util/ccache being installed
@@ -1553,6 +1723,11 @@ live_prep_kconfig() {
     # cost is squashfs bytes, not RAM) — every native profile gets it, and
     # profile fragments merged later can still override single symbols
     frags+=("${LIVE_TPL}/kernel/hardware.fragment")
+    # the HDA vendor codecs + the SOF/ACP DSP path — the base configs carry
+    # only the generic HDA parser, which leaves laptop speakers and HDMI
+    # audio silent (Dell + intelhard, 2026-09-17); shared for the same
+    # reason as hardware.fragment
+    frags+=("${LIVE_TPL}/kernel/audio.fragment")
     # extra symbols the post-merge check insists on, per flavour
     # BTF is the whole point of building with clang (tracee's CO-RE reads
     # /sys/kernel/btf/vmlinux), and it is exactly the kind of symbol
@@ -1585,6 +1760,13 @@ live_prep_kconfig() {
         frags+=("${kf}")
         info "Profile kernel fragment: $(basename "${kf}")"
     done
+    # profile fragments that must not lose a symbol silently: =y names join
+    # kcheck, =m names go to kcheck_m (checked in the same chroot step)
+    local kcheck_m=""
+    if [[ " ${LIVE_KFRAGS} " == *" nftables.fragment "* ]]; then
+        kcheck+=" CONFIG_NF_TABLES_INET CONFIG_NF_TABLES_IPV4 CONFIG_NF_TABLES_IPV6"
+        kcheck_m+=" CONFIG_NFT_CT"
+    fi
     local f
     for f in "${frags[@]}"; do
         [[ -f ${f} ]] || die "Missing Kconfig fragment: ${f}"
@@ -1597,8 +1779,21 @@ live_prep_kconfig() {
     command rm -f "${LIVE_ROOT}/tmp/xstage-kconfig/"*
     local i=0
     for f in "${frags[@]}"; do
-        command cp -f "${f}" "${LIVE_ROOT}/tmp/xstage-kconfig/$((i++))-$(basename "${f}")"
+        # two digits: the merge glob below is [0-9][0-9]-*; a single-digit
+        # glob silently dropped fragment #11 onward (audit 2026-10-11)
+        # printf -v, not $(printf ... $((i++))): inside $( ) the increment
+        # runs in a subshell and is lost, so every fragment was staged as 00-*
+        # and the merge fell back to alphabetical order (10-11 .. 10-16:
+        # live/systemd overrode hardened -> CONFIG_LSM without bpf, DEVMEM=y)
+        local n
+        printf -v n '%02d' "${i}"; i=$((i + 1))
+        command cp -f "${f}" "${LIVE_ROOT}/tmp/xstage-kconfig/${n}-$(basename "${f}")"
     done
+    # every fragment must have its own number, or the merge order is not frags[]
+    local staged
+    staged=$(find "${LIVE_ROOT}/tmp/xstage-kconfig" -maxdepth 1 -name '[0-9][0-9]-*' -printf '%f\n' | cut -c1-2 | sort -u | wc -l)
+    (( staged == ${#frags[@]} )) ||
+        die "kernel fragments staged under ${staged} distinct numbers, expected ${#frags[@]}: merge order would not follow frags[]"
     if [[ ${base} != defconfig && ${base} != host ]]; then
         [[ -f ${base} ]] || die "XSTAGE_LIVE_KCONFIG_BASE='${base}' is neither 'defconfig', 'host', nor a file"
         command cp -f "${base}" "${LIVE_ROOT}/tmp/xstage-kconfig/base.config"
@@ -1674,7 +1869,7 @@ live_prep_kconfig() {
 	# 2. merge the fragments. -m keeps the merge in .config without running
 	#    a config target yet; olddefconfig then answers every new symbol with
 	#    its default instead of prompting (a chroot has no one to prompt).
-	./scripts/kconfig/merge_config.sh -m .config /tmp/xstage-kconfig/[0-9]-*
+	./scripts/kconfig/merge_config.sh -m .config /tmp/xstage-kconfig/[0-9][0-9]-*
 	# LLVM=1 here too, not just in cmd_live_kernel: olddefconfig RESOLVES the
 	# symbols, and the answer depends on the compiler. Under gcc,
 	# CC_HAS_RANDSTRUCT is n, so RANDSTRUCT_FULL falls back to
@@ -1690,6 +1885,31 @@ live_prep_kconfig() {
 	    grep -q "^\${sym}=y" .config ||
 	        { echo "FATAL: \${sym} is not =y after merge — the ISO would not boot" >&2; exit 1; }
 	done
+	# 3b. profile-fragment modules (kcheck_m): a dropped =m symbol is a
+	#     feature that silently never loads
+	for sym in ${kcheck_m}; do
+	    grep -q "^\${sym}=m" .config ||
+	        { echo "FATAL: \${sym} is not =m after merge — a profile fragment lost it" >&2; exit 1; }
+	done
+	# 4. the same for audio.fragment's load-bearing modules: a vendor codec
+	#    or the SOF PCI driver silently dropped by olddefconfig (unmet gate)
+	#    is a laptop that boots mute, found only at the first demo
+	for sym in CONFIG_SND_HDA_CODEC_REALTEK CONFIG_SND_HDA_CODEC_HDMI \\
+	           CONFIG_SND_HDA_CODEC_CONEXANT CONFIG_SND_HDA_SCODEC_CS35L41 \\
+	           CONFIG_SND_SOC_SOF_PCI CONFIG_SND_SOC_SOF_TIGERLAKE \\
+	           CONFIG_SND_SOC_INTEL_SOUNDWIRE_SOF_MACH; do
+	    grep -q "^\${sym}=m" .config ||
+	        { echo "FATAL: \${sym} is not =m after merge — audio.fragment lost a gate" >&2; exit 1; }
+	done
+	# 5. hardened.fragment must win over live/systemd (they sort after it
+	#    alphabetically; the 10-11..10-16 numbering bug let them override it)
+	if ls /tmp/xstage-kconfig/[0-9][0-9]-hardened.fragment >/dev/null 2>&1; then
+	    grep -q '^CONFIG_LSM=".*bpf' .config ||
+	        { echo "FATAL: CONFIG_LSM lacks bpf — a later fragment overrode hardened.fragment" >&2; exit 1; }
+	    if grep -q '^CONFIG_DEVMEM=y' .config; then
+	        echo "FATAL: CONFIG_DEVMEM=y — a later fragment overrode hardened.fragment" >&2; exit 1
+	    fi
+	fi
 	EOF
 }
 
@@ -2166,6 +2386,36 @@ cmd_live_restrict_run() {
     info "Restricted packages installed"
 }
 
+# Hardened images: sudo always asks for the password (2026-10-15). Installs
+# two files from live/sudoers.d/ and removes the password-less 95-* files an
+# earlier configure run left behind:
+#   50-<user>         install-time grant for the default user (a stage3
+#                     /etc/sudoers grants only root); firstrun.txt deletes it
+#                     after installation
+#   60-hardened-sudo  persistent: %wheel with a password, the 15-minute
+#                     timestamp window, the password-free read-only list
+# Validated with the HOST visudo, which reads a foreign-arch file as well as a
+# native one.
+install_hardened_sudoers() {  # install_hardened_sudoers <root> <user>
+    local root="$1" user="$2" src dst f
+    command -v visudo >/dev/null || die "visudo not on the host — cannot validate sudoers"
+    install -d -m 0755 "${root}/etc/sudoers.d"
+    for f in 50-guest 60-hardened-sudo; do
+        src="${LIVE_TPL}/sudoers.d/${f}"
+        [[ -f ${src} ]] || die "missing ${src}"
+        dst="${root}/etc/sudoers.d/${f/#50-guest/50-${user}}"
+        # only the rule lines name the user; comments may keep saying guest
+        sed -e "s/^guest ALL=/${user} ALL=/" -e "s/^Defaults:guest /Defaults:${user} /" "${src}" |
+            install -o root -g root -m 0440 /dev/stdin "${dst}"
+        if ! visudo -cf "${dst}" >/dev/null; then
+            rm -f "${dst}"
+            die "sudoers syntax error in ${dst} — it would lock sudo out on the image"
+        fi
+    done
+    rm -f "${root}/etc/sudoers.d/95-xstage-live" "${root}/etc/sudoers.d/95-xstage-desktop"
+    info "sudo for ${user}: password required (50-${user} + 60-hardened-sudo), password-less 95-* removed"
+}
+
 cmd_live_configure() {
     need_root
     [[ -x ${LIVE_ROOT}/bin/bash ]] || die "No rootfs — run: sudo $0 ${TGT:-amd64} unpack"
@@ -2179,7 +2429,9 @@ cmd_live_configure() {
 
     # same host-side hash trick as the SD images — no plaintext in the chroot
     local hash; hash=$(openssl passwd -6 "${ZERO_PASS}") || die "openssl passwd failed"
-    sed -i "s|^root:[^:]*:|root:${hash}:|" "${LIVE_ROOT}/etc/shadow" ||
+    # sed exits 0 on NO match (no root line, odd format) — verify the result
+    sed -i "s|^root:[^:]*:|root:${hash}:|" "${LIVE_ROOT}/etc/shadow" &&
+        grep -q "^root:${hash}:" "${LIVE_ROOT}/etc/shadow" ||
         die "could not set the root password in ${LIVE_ROOT}/etc/shadow"
 
     mkdir -p "${LIVE_ROOT}/etc/ssh/sshd_config.d"
@@ -2211,18 +2463,44 @@ cmd_live_configure() {
     # salt survives the unquoted heredoc.
     if [[ -n ${LIVE_USER} ]]; then
         info "Live user '${LIVE_USER}' (password '${ZERO_PASS}', autologin)"
+        local lu_skip="root nogroup nobody ${LIVE_USER}" lu_drop=""
+        if [[ ${LIVE_PORTAGE_PROFILE} == *hardened* ]]; then
+            lu_skip+=" ${XSTAGE_ROOT_EQUIV_GROUPS}"
+            lu_drop="${XSTAGE_ROOT_EQUIV_GROUPS}"
+            info "Hardened profile — live user kept out of: ${XSTAGE_ROOT_EQUIV_GROUPS}"
+        fi
         live_chroot live-user <<-EOF
-	id -u ${LIVE_USER} >/dev/null 2>&1 ||
+	if id -u ${LIVE_USER} >/dev/null 2>&1; then
+	    # a re-run: useradd -m is what copies /etc/skel, so files the layers
+	    # added since (conf -> configure again) never reached the home.
+	    # cp -n adds what is missing and leaves the account's own files alone.
+	    echo "live user ${LIVE_USER} exists — adding missing /etc/skel files" >&2
+	    cp -an /etc/skel/. /home/${LIVE_USER}/
+	    chown -R ${LIVE_USER}:${LIVE_USER} /home/${LIVE_USER}
+	else
 	    useradd -m -c "Live user" -s /bin/bash -p '${hash}' ${LIVE_USER}
+	fi
 	# Every group the image defines, not a hand-picked list (user rule
 	# 2026-08-06): a live medium is expected to reach all hardware and every
 	# service group without a reinstall, and the set differs per profile.
 	# Skipped: root, so root-group-owned files stay out of reach of a plain
 	# guest process, and the two "no privileges" groups, where membership
-	# means nothing.
+	# means nothing. A hardened profile also skips XSTAGE_ROOT_EQUIV_GROUPS.
 	for g in \$(cut -d: -f1 /etc/group); do
-	    case \${g} in root|nogroup|nobody|${LIVE_USER}) continue ;; esac
-	    gpasswd -a ${LIVE_USER} \${g} >/dev/null || true
+	    case " ${lu_skip} " in *" \${g} "*) continue ;; esac
+	    gpasswd -a ${LIVE_USER} \${g} >/dev/null || echo "gpasswd -a ${LIVE_USER} \${g} failed" >&2
+	done
+	# A re-run never takes a group away by itself, so a rootfs built before
+	# the hardened exclusion would keep them: drop them explicitly.
+	# No 'id | grep -q' pipe: under the chroot's pipefail an early grep exit
+	# can SIGPIPE the writer and turn a match into "not a member". A failed
+	# removal is fatal (the step dies), unlike a failed add: a hardened image
+	# must not ship with the user still in a root-equivalent group.
+	for g in ${lu_drop}; do
+	    case " \$(id -nG ${LIVE_USER}) " in
+	        *" \${g} "*) gpasswd -d ${LIVE_USER} "\${g}" >/dev/null ||
+	                     { echo "gpasswd -d ${LIVE_USER} \${g} failed" >&2; exit 1; } ;;
+	    esac
 	done
 	EOF
         if [[ -n ${XSTAGE_LIVE_XSESSION:-} ]]; then
@@ -2283,7 +2561,10 @@ cmd_live_configure() {
         # so it never fired and every image so far gave the live user no sudo
         # at all. Create it; only a missing sudo binary is a real reason to
         # skip, and that gets a warning rather than silence.
-        if [[ -x ${LIVE_ROOT}/usr/bin/sudo ]]; then
+        if [[ -x ${LIVE_ROOT}/usr/bin/sudo && ${LIVE_PORTAGE_PROFILE} == *hardened* ]]; then
+            # hardened: no password-less sudo, not even on the live medium
+            install_hardened_sudoers "${LIVE_ROOT}" "${LIVE_USER}"
+        elif [[ -x ${LIVE_ROOT}/usr/bin/sudo ]]; then
             install -d -m 0755 "${LIVE_ROOT}/etc/sudoers.d"
             # The explicit user line is not redundant with %wheel: it keeps
             # sudo working if the account is ever created outside wheel, and
@@ -2341,7 +2622,11 @@ cmd_live_configure() {
     info "Service manager: ${LIVE_RC} (stage3 flavour ${LIVE_FLAVOR_NAME})"
     local want=(sshd dbus)
     if [[ ${LIVE_RC} == systemd ]]; then
-        local units=(sshd.service dbus.service)
+        # dbus.service is static (no [Install]): the dbus package ships its own
+        # sockets.target.wants/dbus.socket + multi-user.target.wants links, so
+        # 'systemctl enable' on it is a no-op that only prints the long
+        # "no installation config" notice. Not listed for that reason.
+        local units=(sshd.service)
         [[ -e ${LIVE_ROOT}/usr/lib/systemd/system/NetworkManager.service ]] &&
             units+=(NetworkManager.service)
         [[ -n ${XSTAGE_LIVE_XSESSION:-} && -e ${LIVE_ROOT}/usr/lib/systemd/system/sddm.service ]] &&
@@ -2353,8 +2638,14 @@ cmd_live_configure() {
         [[ -e ${LIVE_ROOT}/usr/lib/systemd/system/logrotate.timer ]] &&
             units+=(logrotate.timer)
         live_chroot enable-units <<-EOF
-		systemctl enable ${units[*]} || true
-		systemctl set-default graphical.target 2>/dev/null || true
+		# one at a time and FATAL: 'enable a b c || true' shipped an image
+		# with no display manager and said nothing (audit 2026-10-11)
+		fail=0
+		for u in ${units[*]}; do
+		    systemctl enable "\$u" || { echo "systemctl enable \$u FAILED" >&2; fail=1; }
+		done
+		systemctl set-default graphical.target || { echo "set-default graphical.target FAILED" >&2; fail=1; }
+		[ "\$fail" = 0 ] || exit 1
 		EOF
         live_sound_units
     else
@@ -2383,14 +2674,14 @@ cmd_live_configure() {
     info "Configured."
 }
 
-# genkernel with CDROOT=1: exactly what bin/v does, and the reason the ISO
-# needs no root= — the initrd hunts for the /livecd marker itself
+# genkernel builds the kernel + initramfs; the ISO needs no root= because
+# 'cdroot' (LIVE_APPEND) makes the initrd hunt for the /livecd marker
 cmd_live_kernel() {
     need_root
     [[ -x ${LIVE_ROOT}/bin/bash ]] || die "No rootfs — run: sudo $0 ${TGT:-amd64} unpack"
     live_prep_kconfig
 
-    info "Building the live kernel with genkernel (CDROOT=1) — this takes a while"
+    info "Building the live kernel with genkernel — this takes a while"
     live_chroot kernel <<-EOF
 	# --ignore-default-opts for the same reason as the kconfig step: the
 	# image's EMERGE_DEFAULT_OPTS would drag the stage3 transition graph in
@@ -2398,7 +2689,12 @@ cmd_live_kernel() {
 	    emerge --ignore-default-opts --verbose --oneshot sys-kernel/genkernel
 	[ -f /usr/src/linux/.config ] || { echo "no /usr/src/linux/.config" >&2; exit 1; }
 
-	sed -i 's/CDROOT="0"/CDROOT="1"/' /usr/share/genkernel/defaults/initrd.defaults
+	# genkernel's default CDROOT=0, never baked to 1: live boots get CD mode
+	# from the 'cdroot' parameter (LIVE_APPEND), and installed hosts boot this
+	# same kernel with root=… (a baked 1 dropped kdehard to 'Could not find CD
+	# to boot', 2026-10-13)
+	grep -qE "^CDROOT=['\"]0['\"]" /usr/share/genkernel/defaults/initrd.defaults ||
+	    { echo "initrd.defaults: CDROOT is not 0" >&2; exit 1; }
 	# LLVM=1 (env, which kbuild imports) builds the whole kernel with clang.
 	# It is what makes CONFIG_DEBUG_INFO_BTF possible at all: BTF 'depends on
 	# !GCC_PLUGIN_RANDSTRUCT', and the hardened images set RANDSTRUCT_FULL, so
@@ -2426,7 +2722,6 @@ cmd_live_kernel() {
 	    --kernel-strip=llvm-strip --kernel-as=clang \\
 	    --strip=modules --no-module-rebuild \\
 	    --luks --lvm --btrfs --busybox --no-clean all
-	sed -i 's/CDROOT="1"/CDROOT="0"/' /usr/share/genkernel/defaults/initrd.defaults
 	EOF
     # keep the exact config next to the artifacts: without it a built ISO
     # cannot be reproduced or bisected later
@@ -2446,12 +2741,16 @@ cmd_live_kernel() {
 
     # Pass 2: same kernel relinked with the initramfs built in
     # (CONFIG_INITRAMFS_SOURCE). A UEFI firmware boot entry can exec this one
-    # PE binary directly — no bootloader, no separate initrd, no cmdline (the
-    # CDROOT logic hunts for the /livecd marker itself). The split pair from
-    # pass 1 stays the GRUB/isolinux payload.
+    # PE binary directly — no bootloader, no separate initrd. It is the kernel
+    # kxplant puts on installed hosts (root=… on the EFI entry); for a live
+    # boot from the stick's firmware entry it needs 'cdroot' plus the
+    # LIVE_APPEND loop= options on the command line, since CDROOT stays 0.
+    # The split pair from pass 1 stays the GRUB/isolinux payload.
     info "Building the stub kernel (integrated initramfs) for direct UEFI boot"
     live_chroot kernel-stub <<-EOF
-	sed -i 's/CDROOT="0"/CDROOT="1"/' /usr/share/genkernel/defaults/initrd.defaults
+	# CDROOT must stay 0 — see the kernel step
+	grep -qE "^CDROOT=['\"]0['\"]" /usr/share/genkernel/defaults/initrd.defaults ||
+	    { echo "initrd.defaults: CDROOT is not 0" >&2; exit 1; }
 	# same toolchain as pass 1 — a gcc relink here would produce a stub whose
 	# modules the pass-1 kernel cannot load (different vermagic/RANDSTRUCT hash)
 	LLVM=1 genkernel --makeopts=-j${JOBS} --kernel-config=/usr/src/linux/.config \\
@@ -2461,7 +2760,6 @@ cmd_live_kernel() {
 	    --kernel-strip=llvm-strip --kernel-as=clang \\
 	    --strip=modules --no-module-rebuild \\
 	    --luks --lvm --btrfs --busybox --no-clean --integrated-initramfs all
-	sed -i 's/CDROOT="1"/CDROOT="0"/' /usr/share/genkernel/defaults/initrd.defaults
 	EOF
     k=$(ls -1t "${LIVE_ROOT}/boot/"{vmlinuz,kernel}-* 2>/dev/null | head -1 || true)
     [[ -n ${k} ]] || die "stub pass produced no kernel in ${LIVE_ROOT}/boot"
@@ -2509,7 +2807,9 @@ cmd_live_kernel() {
         kmods+="$(echo "${kc}" | sed -E 's/-[0-9][0-9a-zA-Z._]*(-r[0-9]+)?$//') "
     done < <(grep -ls '^obj /lib/modules/' "${LIVE_ROOT}"/var/db/pkg/*/*/CONTENTS 2>/dev/null |
              sed 's|.*/var/db/pkg/||; s|/CONTENTS$||')
-    if [[ -n ${kmods} ]]; then
+    if [[ -z ${kmods} ]]; then
+        info "No vdb package owns files under /lib/modules — nothing to rebuild (expected only on a tree without out-of-tree modules)"
+    else
         info "Rebuilding kernel-module packages against the fresh tree: ${kmods}"
         live_chroot kmod-rebuild <<-EOF
 	emerge --ignore-default-opts --verbose --keep-going --oneshot --quiet-build=y \\
@@ -2593,9 +2893,11 @@ cmd_live_kernel() {
     # prove it happened.
     local modsz debugko
     modsz=$(du -sm "${LIVE_ROOT}/lib/modules" 2>/dev/null | cut -f1)
-    debugko=$(find "${LIVE_ROOT}/lib/modules" -name '*.ko' -exec sh -c \
+    # "|| true" on the find side: with more than 5 hits head closes the pipe,
+    # find gets SIGPIPE and pipefail turned the WARNING case into a silent exit
+    debugko=$({ find "${LIVE_ROOT}/lib/modules" -name '*.ko' -exec sh -c \
         'readelf -S "$1" 2>/dev/null | grep -q ".debug_info" && echo "$1"' _ {} \; \
-        2>/dev/null | head -5)
+        2>/dev/null || true; } | head -5)
     if [[ -n ${debugko} ]]; then
         warn "modules still carry DWARF (${modsz} MB) — genkernel ignored --strip=modules:"
         printf '  %s\n' ${debugko} >&2
@@ -2622,7 +2924,7 @@ live_write_release() {
         echo "# xstage image provenance — the inputs of this build"
         echo "profile=${XPROFILE:-none}"
         echo "built=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        echo "builder=$(hostname)"
+        echo "builder=${XSTAGE_BUILD_HOST:-$(hostname)}"
         echo "rpilinuxlab=${labhead}"
         [[ -f ${LIVE_BLD}/stage3.provenance ]] && cat "${LIVE_BLD}/stage3.provenance"
         echo "gentoo_tree=${treestamp}"
@@ -2653,8 +2955,11 @@ cmd_live_rmkernel() {
     need_root
     local ver="${1:-}"
     [[ -n ${ver} ]] ||
-        die "Usage: $0 ${TGT} rmkernel <version>   (e.g. rmkernel 7.1.5)"
+        die "Usage: $0 ${TGT} rmkernel <upstream version>   (e.g. rmkernel 7.1.5 — not the /lib/modules name 7.1.5-zen1-x86_64)"
     [[ -d ${LIVE_ROOT} ]] || die "No live tree at ${LIVE_ROOT}"
+    # the version is interpolated into globs that feed rm -rf — a wildcard or
+    # a path component here would widen the victim list
+    [[ ${ver} =~ ^[0-9]+(\.[0-9]+){1,3}(-r[0-9]+)?$ ]] || die "rmkernel: '${ver}' is not a plain upstream version (e.g. 7.1.5)"
 
     # Refuse the SELECTED kernel, whichever it is. Not "select a newer one":
     # rolling BACK — point the symlink at the old kernel and drop the new one —
@@ -2694,6 +2999,35 @@ cmd_live_rmkernel() {
 
     [[ ${#victims[@]} -gt 0 || ${#vdb[@]} -gt 0 ]] ||
         die "Nothing matching kernel ${ver} in ${LIVE_ROOT}"
+
+    # The argument is the UPSTREAM version ('7.2.3'), which is what the sources
+    # package carries. Passing the /lib/modules name ('7.2.3-zen1-x86_64')
+    # instead matches SOME of the globs above and not others: /lib/modules/<ver>
+    # and the bare /boot pair are collected, while the 12 GB built source tree,
+    # the .old and .img boot files, the genkernel cpio and the vdb package are
+    # all missed -- and the guard above stays quiet, because victims is not
+    # empty. Deleting a package's files while leaving the package merged is
+    # worse than either doing the job or refusing it, so name the mistake.
+    # The tell is exact: an installed *sources package whose version is a strict
+    # prefix of what was passed. An orphaned /lib/modules left behind by an
+    # already-unmerged kernel -- the case the nullglob comment above is about --
+    # has no such package and still removes normally.
+    # (2026-09-22, found while moving the four hard images 7.2.3 -> 7.2.7.)
+    if [[ ${#vdb[@]} -eq 0 ]]; then
+        shopt -s nullglob
+        local s pv
+        for s in "${LIVE_ROOT}/var/db/pkg/sys-kernel/"*sources-*; do
+            [[ -d ${s} ]] || continue
+            pv=$(basename "${s}")
+            pv="${pv##*sources-}"
+            # a revbump still takes the bare version: '*sources-${ver}-'* covers -rN
+            [[ ${pv} =~ ^(.+)-r[0-9]+$ ]] && pv="${BASH_REMATCH[1]}"
+            [[ ${ver} == "${pv}"-* ]] || continue
+            shopt -u nullglob
+            die "'${ver}' looks like the /lib/modules name, not a kernel version — sys-kernel/$(basename "${s}") is the package that owns this kernel. Re-run with: rmkernel ${pv}"
+        done
+        shopt -u nullglob
+    fi
 
     # a tree with exactly one kernel left is not a tree to take a kernel from.
     # Count what does NOT belong to ${ver} rather than comparing array sizes.
@@ -2835,6 +3169,9 @@ ${stale}"
     # into thousands of log lines.
     local sqprogress=()
     [[ -t 1 ]] || sqprogress=(-no-progress)
+    # -no-xattrs is deliberate (decision 2026-10-11): file capabilities and
+    # IMA/SELinux labels are NOT shipped in the live image; the live kernel
+    # does not need SQUASHFS_XATTR, and ping & co. are setuid-free anyway.
     mksquashfs "${LIVE_ROOT}" "${LIVE_ISO_DIR}/livecd.squashfs" \
         -comp "${LIVE_COMP}" -noappend "${sqprogress[@]}" -b 1048576 -no-xattrs \
         -e "${excl[@]}" || die "mksquashfs failed"
@@ -2958,8 +3295,8 @@ cmd_live_usb() {
     [[ -x ${USB_TOOLS}/build-usb ]] || die "No ${USB_TOOLS}/build-usb"
     [[ -x ${USB_TOOLS}/build-initrd-uuid-next ]] || die "No ${USB_TOOLS}/build-initrd-uuid-next"
     local name="${dev#/dev/}"
-    lsblk -no MOUNTPOINTS "${dev}" | grep -qx / &&
-        die "${dev} holds the root filesystem — refusing"
+    local mps; mps=$(lsblk -no MOUNTPOINTS "${dev}")
+    grep -qx / <<<"${mps}" && die "${dev} holds the root filesystem — refusing"
     local removable idbus
     removable=$(cat "/sys/block/${name}/removable" 2>/dev/null || echo 0)
     idbus=$(udevadm info --query=property --name="${dev}" | { grep '^ID_BUS=' || true; } | cut -d= -f2)
@@ -2969,6 +3306,9 @@ cmd_live_usb() {
     local p1="${dev}1" p2="${dev}2"
     # desktop automount grabs the stick on plug-in; DATA partitions stay put
     umount "${p1}" "${p2}" 2>/dev/null || true
+    local still; still=$(lsblk -nro NAME,MOUNTPOINTS "${dev}" | awk 'NF > 1')
+    [[ -z ${still} ]] || die "${dev} still has mounted partitions (busy?):
+${still}"
     if [[ ${wipe} == 1 || $(lsblk -no FSTYPE "${p1}" 2>/dev/null) != vfat \
           || $(lsblk -no FSTYPE "${p2}" 2>/dev/null) != ext4 ]]; then
         # build-usb shows the device, asks its own 'yes', partitions, formats
@@ -2977,11 +3317,13 @@ cmd_live_usb() {
         partprobe "${dev}" 2>/dev/null || true; sleep 1
     else
         info "Reusing existing ESP+LIVE layout on ${dev} (--wipe repartitions, wiping DATA too)"
+        confirm "Write the new kernel/initrd/squashfs onto ${dev} (${p1}, ${p2})?"
     fi
     [[ -b ${p1} && -b ${p2} ]] || die "Missing ${p1}/${p2} after layout step"
 
     local uuid
-    uuid=$(lsblk -no UUID "${p2}" | head -n1)
+    udevadm settle 2>/dev/null || true
+    uuid=$(blkid -p -o value -s UUID "${p2}")   # -p: probe, not the udev cache (a stale UUID bakes into the initrd)
     [[ -n ${uuid} ]] || die "No filesystem UUID on ${p2}"
     info "LIVE partition ${p2}: UUID=${uuid}"
     # The initrd is rebuilt per stick (UUID is baked in). Its busybox must
@@ -3006,11 +3348,15 @@ cmd_live_usb() {
         warn "no genkernel-built busybox in the image — host-compiled fallback (host glibc ISA leaks into static binaries)"
     fi
     mkdir -p "${DL_DIR}/uuid-initrd"
+    # the previous stick's initrd (its UUID baked in) must not survive a
+    # build that exits 0 without writing a new one
+    command rm -f "${DL_DIR}/uuid-initrd/initrd.uuid.cpio.gz"
     ( cd "${DL_DIR}/uuid-initrd" &&
       "${USB_TOOLS}/build-initrd-uuid-next" --uuid "${uuid}" \
           --init "${LIVE_INIT}" --tmpfs-mb 8192 \
           ${bb_dir:+--busybox-bin "${bb_dir}/bin/busybox"} ) ||
         die "build-initrd-uuid-next failed"
+    [[ -s ${DL_DIR}/uuid-initrd/initrd.uuid.cpio.gz ]] || die "build-initrd-uuid-next exited 0 but wrote no initrd.uuid.cpio.gz"
     [[ -n ${bb_dir} ]] && command rm -rf "${bb_dir}"
 
     local mnt
@@ -3042,8 +3388,11 @@ cmd_live_usb() {
     # (the commented debug lines start with '#' and don't match the anchor)
     sed -i "s|^\( *\)initrd .*|\1initrd ${uc_files}/initrd.uuid.cpio.gz|" \
         "${mnt}/boot/grub/grub.cfg" || die "grub.cfg initrd-line rewrite failed"
-    # stub kernel with builtin initramfs: bootable straight from the firmware
-    # menu / efibootmgr without GRUB (kernel EFI stub, no cmdline needed)
+    grep -q "initrd ${uc_files}/initrd.uuid.cpio.gz" "${mnt}/boot/grub/grub.cfg" ||
+        die "grub.cfg has no initrd line to rewrite — the stick would boot the old initrd"
+    # stub kernel with builtin initramfs: bootable without GRUB, but a live
+    # boot needs a command line with 'cdroot' + the loop= options (CDROOT=0
+    # is baked in, see the kernel step); installed hosts pass root=… instead
     if [[ -f ${LIVE_BLD}/bzImage-stub ]]; then
         mkdir -p "${mnt}/EFI/Gentoo"
         command cp -f "${LIVE_BLD}/bzImage-stub" "${mnt}/EFI/Gentoo/gentoo-stub.efi"
@@ -3054,6 +3403,8 @@ cmd_live_usb() {
     info "LIVE ${p2}: livecd.squashfs ($(du -h "${LIVE_ISO_DIR}/livecd.squashfs" | cut -f1))"
     command cp -f "${LIVE_ISO_DIR}/livecd.squashfs" "${mnt}/livecd.squashfs"
     sync
+    cmp -s "${LIVE_ISO_DIR}/livecd.squashfs" "${mnt}/livecd.squashfs" ||
+        die "livecd.squashfs on ${p2} differs from the source after copy — bad stick or short write"
     umount "${mnt}"
     trap - EXIT
     rmdir "${mnt}"
@@ -3061,19 +3412,29 @@ cmd_live_usb() {
     info "USB ready: UEFI GRUB on ${p1}, initrd finds ${p2} by UUID=${uuid}."
 }
 
+# live_status [--du] — the rootfs size is opt-in: du over a built image walks
+# 60-200 GB and took 82 s on amdkdehard (2026-10-19), which made 'xp status'
+# look hung. Without --du the rootfs field says ok/- in milliseconds.
 live_status() {
-    local rootfs="-" sq="-" krn="-" iso="-" n=0
-    [[ -x ${LIVE_ROOT}/bin/bash ]] && rootfs=$(du -sh "${LIVE_ROOT}" 2>/dev/null | cut -f1 || true)
+    local rootfs="-" sq="-" krn="-" iso="-" n=0 du=no
+    [[ ${1:-} == --du ]] && du=yes
+    if [[ -x ${LIVE_ROOT}/bin/bash ]]; then
+        if [[ ${du} == yes ]]; then rootfs=$(du -sh "${LIVE_ROOT}" 2>/dev/null | cut -f1 || true)
+        else rootfs="ok (--du for size)"; fi
+    fi
     [[ -f ${LIVE_ISO_DIR}/livecd.squashfs ]] && sq=$(du -h "${LIVE_ISO_DIR}/livecd.squashfs" | cut -f1)
     [[ -f ${LIVE_BLD}/bzImage ]] && krn=$(du -h "${LIVE_BLD}/bzImage" | cut -f1)
     [[ -f ${LIVE_IMG} ]] && iso=$(du -h "${LIVE_IMG}" | cut -f1)
     n=$(live_pkg_list 2>/dev/null | grep -c . || true)
     echo "live   profile:${XPROFILE:-none}  stage3:${LIVE_FLAVOR_NAME}  rc:${LIVE_RC}  tree:${LIVE_BLD#"${REPO}"/}  pkgs:${n}"
     echo "       rootfs:${rootfs}  kernel:${krn}  squashfs:${sq}  iso:${iso}"
+    local sess; sess=$(live_foreign_sessions "${LIVE_ROOT}" 2>/dev/null || true)
+    [[ -z ${sess} ]] || echo "       session inside (pids:${sess}) — its mounts: sudo nsenter -m -t <pid> findmnt -R ${LIVE_ROOT}"
 }
 
 cmd_live_clean() {
     confirm "Remove ${LIVE_BLD}?"
+    no_mounts_under "${LIVE_BLD}"
     command rm -rf "${LIVE_BLD}"
     info "Cleaned live tree."
 }
@@ -3090,6 +3451,76 @@ cmd_live_emerge() {
     live_chroot emerge <<-EOF
 	emerge${args}
 	EOF
+}
+
+# Serve this profile's binpkg cache over HTTP for other machines running the same
+# image (a laptop on amdkdehard pulling from the build host). One cache = one -march
+# (amdkdehard/nvidiahard znver3, intelhard x86-64-v3, corehard x86-64-v2), so the
+# stanza printed below names both; the real protection is client-side: the image's
+# bashrc.d/05-xp-binpkg-march.sh refuses any binary package whose -march is not a
+# subset of the client's own, whichever binhost it came from. Plain HTTP, no auth:
+# LAN only. Root because the per-package dirs in a binpkg cache are 0700.
+cmd_live_binhost() {
+    need_root
+    local port="${1:-${LAB_LIVE_BINHOST_PORT:-8687}}"
+    local dir="${LIVE_BINPKGS_DIR}"
+    [[ -n ${dir} && -d ${dir} ]] || die "No binpkg cache for this profile (PROF_LIVE_BINPKGS_DIR='${dir}')"
+    [[ -f ${dir}/Packages ]] || die "${dir} has no Packages index — run: PKGDIR=${dir} emaint binhost --fix"
+    local ip march name
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+') || true
+    [[ -n ${ip} ]] || die "Cannot work out this host's LAN address (no default route?)"
+    march=$(grep -oP -- '-march=\K\S+' <<< "${LIVE_CFLAGS}" | tail -n 1)
+    name="xp-$(basename "${dir}")"
+    info "Serving ${dir} (-march=${march:-unset}, $(du -sh "${dir}" 2>/dev/null | cut -f1)) on http://${ip}:${port}/"
+    echo
+    echo "On the client — /etc/portage/binrepos.conf/${name}.conf:"
+    echo "  [${name}]"
+    echo "  # binpkgs built with -march=${march:-unset}; only for machines that can run it"
+    echo "  sync-uri = http://${ip}:${port}/"
+    echo "  priority = 10"
+    echo "  verify-signature = false"
+    echo
+    echo "Then: emerge -avuDN --getbinpkg --binpkg-respect-use=y \\"
+    echo "        --usepkg-exclude 'sys-kernel/* x11-drivers/nvidia-drivers app-emulation/virtualbox-modules' @world"
+    echo "(kernel modules never come from a binhost: they are bound to one kernel build)"
+    echo "Guard: /etc/portage/bashrc.d/05-xp-binpkg-march.sh must be on the client (hard images ship it)."
+    echo "Ctrl-C here to stop serving."
+    binhost_fw_open "${ip}" "${port}"
+    trap 'binhost_fw_close' EXIT
+    trap 'binhost_fw_close; exit 130' INT
+    trap 'binhost_fw_close; exit 143' TERM
+    python3 -m http.server --bind "${ip}" --directory "${dir}" "${port}" || true
+    binhost_fw_close
+    trap - EXIT HUP INT TERM
+}
+
+# A host whose INPUT policy is DROP (nvhard: only ssh, mDNS and ntfy from the LAN) silently drops the
+# binhost port: clients hang on Packages instead of being refused. Open the port for the LAN of the
+# serving address only, for as long as http.server runs. -C/-D match the exact rule spec, so the close
+# (and a leftover from a killed run) removes only this rule. No '-m comment': the hardened kernels lack
+# xt_comment. iptables only (legacy or nft backend); without iptables this does nothing and says so.
+BINHOST_FW_RULE=()
+binhost_fw_open() {
+    local ip=$1 port=$2 lan
+    command -v iptables >/dev/null || { warn "no iptables: open tcp ${port} in your firewall by hand if clients hang"; return 0; }
+    lan=$(ip -4 route show proto kernel scope link src "${ip}" 2>/dev/null | awk 'NR==1 {print $1}')
+    [[ -n ${lan} ]] || { warn "cannot find the LAN of ${ip}: firewall left as it is"; return 0; }
+    BINHOST_FW_RULE=(INPUT -s "${lan}" -p tcp --dport "${port}" -m conntrack --ctstate NEW -j ACCEPT)
+    if iptables -C "${BINHOST_FW_RULE[@]}" 2>/dev/null; then
+        info "firewall: tcp ${port} from ${lan} already open (rule left by an earlier run, closed on exit)"
+    elif iptables -I "${BINHOST_FW_RULE[@]}"; then
+        info "firewall: opened tcp ${port} for ${lan} until Ctrl-C"
+    else
+        warn "firewall: could not open tcp ${port} - clients may hang"; BINHOST_FW_RULE=()
+    fi
+}
+binhost_fw_close() {
+    [[ ${#BINHOST_FW_RULE[@]} -gt 0 ]] || return 0
+    while iptables -C "${BINHOST_FW_RULE[@]}" 2>/dev/null; do
+        iptables -D "${BINHOST_FW_RULE[@]}" || break
+    done
+    info "firewall: closed tcp ${BINHOST_FW_RULE[6]}"
+    BINHOST_FW_RULE=()
 }
 
 # Hold a package at the version the rootfs already has. 'pkgs' pass 1
@@ -3196,29 +3627,50 @@ cmd_live_clean_world() {
 cmd_live_enter() {
     need_root
     [[ -x ${LIVE_ROOT}/bin/bash ]] || die "No rootfs — run: sudo $0 ${TGT:-amd64} unpack"
+    # shellcheck disable=SC2064 — expand ${LIVE_ROOT} now, not at trap time
+    # (armed before the first mount, INT/TERM exit — same reasons as live_chroot)
+    live_chroot_mounted "${LIVE_ROOT}"
+    # No HUP trap on purpose: bash defers a trap until the foreground command
+    # returns, and for 'enter' that is the interactive shell - a closed terminal
+    # then left xstage waiting until sudo killed it, with no cleanup at all
+    # (2026-10-19). Bash's default SIGHUP handling runs the EXIT trap at once;
+    # live_chroot_reap inside it ends what the session left behind.
+    trap "live_chroot_umount '${LIVE_ROOT}'" EXIT
+    trap "live_chroot_umount '${LIVE_ROOT}'; exit 130" INT
+    trap "live_chroot_umount '${LIVE_ROOT}'; exit 143" TERM
     command cp -f /etc/resolv.conf "${LIVE_ROOT}/etc/resolv.conf"
+    # a leak from an interrupted session (binds, no /proc - the guard above
+    # passed) must go BEFORE the new binds: a bind stacked on a leaked
+    # SHARED one propagates a copy of the whole tree onto the host's /sys
+    # peers (measured: +4 stacked /sys per conf, 2026-11-08)
+    live_chroot_umount "${LIVE_ROOT}"
     mount -t proc  none "${LIVE_ROOT}/proc"
-    mount --rbind /sys  "${LIVE_ROOT}/sys";  mount --make-rslave "${LIVE_ROOT}/sys"
-    mount --rbind /dev  "${LIVE_ROOT}/dev";  mount --make-rslave "${LIVE_ROOT}/dev"
+    # bind + propagation in ONE mount process: bash delivers a deferred Ctrl-C
+    # between two commands, and a tree left as a shared peer of the host's
+    # /sys cannot be unmounted while the host's cgroup2 is busy (2026-11-08)
+    mount --rbind --make-rslave /sys "${LIVE_ROOT}/sys"
+    mount --rbind --make-rslave /dev "${LIVE_ROOT}/dev"
     live_ccache_mount
     live_distfiles_mount
     live_builddir_mount
     live_binpkgs_mount
-    # shellcheck disable=SC2064 — expand ${LIVE_ROOT} now, not at trap time
-    trap "live_chroot_umount '${LIVE_ROOT}'" EXIT INT TERM
     info "Entering ${LIVE_ROOT} — 'exit' to leave (mounts are undone on the way out)"
+    in_session_ns && info "session namespace: the binds are invisible on the host; from another shell: sudo nsenter -m -t $$ findmnt -R ${LIVE_ROOT}"
     local rc=0
     # PS1 so a root shell inside the image is never mistaken for the host's.
     # Start in /root, not /: chroot always lands on the new root, and that is
     # both a worse place to work and easy to mistake for the host's /.
-    LC_ALL=C.UTF-8 chroot "${LIVE_ROOT}" /bin/bash -c \
+    chroot "${LIVE_ROOT}" /usr/bin/env -i HOME=/root TERM="${TERM:-dumb}" LC_ALL=C.UTF-8 \
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        ${http_proxy:+http_proxy="${http_proxy}"} ${https_proxy:+https_proxy="${https_proxy}"} \
+        ${no_proxy:+no_proxy="${no_proxy}"} XPROFILE="${XPROFILE:-live}" /bin/bash -c \
         'source /etc/profile >/dev/null 2>&1 || true
          cd /root 2>/dev/null || cd /
          export HOME=/root
          export PS1="(${XPROFILE:-live}) \w \\\$ "
          exec /bin/bash --norc -i' "$@" || rc=$?
     live_chroot_umount "${LIVE_ROOT}"
-    trap - EXIT INT TERM
+    trap - EXIT HUP INT TERM
     info "Left the image chroot (exit ${rc})"
     return 0
 }
@@ -3475,9 +3927,18 @@ tiny_img_mount() {  # $1 = partition device
 }
 
 tiny_img_umount() {
-    # two layers: the partition mount and the private bind under it
-    if mountpoint -q "${TINY_MNT}"; then umount "${TINY_MNT}" || warn "umount ${TINY_MNT} failed"; fi
-    if mountpoint -q "${TINY_MNT}"; then umount "${TINY_MNT}" || warn "bind umount ${TINY_MNT} failed"; fi
+    # two layers: the partition mount and the private bind under it. A failed
+    # umount used to be a warning, after which losetup -d detached lazily and
+    # "sd.img ready" was printed over an unflushed, still-mounted filesystem
+    # (audit 2026-10-11) — now it is fatal.
+    sync
+    local i
+    for i in 1 2 3 4; do
+        mountpoint -q "${TINY_MNT}" || return 0
+        umount "${TINY_MNT}" 2>/dev/null || sleep 1
+    done
+    mountpoint -q "${TINY_MNT}" || return 0
+    die "umount ${TINY_MNT} failed (busy?) — the image is NOT finished; umount by hand and rerun"
 }
 
 cmd_tiny_image() {
@@ -3624,7 +4085,9 @@ tiny_ssh_config() {
     # rootfs shadow — no chroot needed, the file format is arch-independent
     local hash
     hash=$(openssl passwd -6 "${ZERO_PASS}") || die "openssl passwd failed"
-    sed -i "s|^root:[^:]*:|root:${hash}:|" "${TINY_ROOT}/etc/shadow" ||
+    # sed exits 0 on NO match (no root line, odd format) — verify the result
+    sed -i "s|^root:[^:]*:|root:${hash}:|" "${TINY_ROOT}/etc/shadow" &&
+        grep -q "^root:${hash}:" "${TINY_ROOT}/etc/shadow" ||
         die "could not set the root password in ${TINY_ROOT}/etc/shadow"
 
     # key login too, if the invoking user has an ed25519 key (or named one)
@@ -3747,14 +4210,18 @@ tiny_make_image() {  # tiny_make_image <rpi400|rpi3|zero2w>
         mkpart primary ext4 "$((BOOT_MB + 1))MiB" 100%
     local loop
     loop=$(losetup -Pf --show "${TINY_IMG}")
+    udevadm settle 2>/dev/null || true
+    [[ -b ${loop}p1 && -b ${loop}p2 ]] || die "partition nodes ${loop}p1/p2 did not appear"
     # shellcheck disable=SC2064 — expand ${loop} now, it's gone at trap time
-    trap "tiny_img_umount; losetup -d ${loop} 2>/dev/null || true" EXIT INT TERM
+    trap "tiny_img_umount; losetup -d ${loop} 2>/dev/null || true" EXIT
+    trap "tiny_img_umount; losetup -d ${loop} 2>/dev/null || true; exit 130" INT
+    trap "tiny_img_umount; losetup -d ${loop} 2>/dev/null || true; exit 143" TERM
     mkfs.vfat -F32 -n RPIBOOT "${loop}p1" >/dev/null
     mkfs.ext4 -q -L "${ROOT_LABEL}" "${loop}p2"
     # MBR disk id -> root=PARTUUID=<id>-02: survives dd, so the identical
     # cmdline works in qemu and on the physical card regardless of mmcblk N
     local ptuuid
-    ptuuid=$(blkid -o value -s PTUUID "${loop}")
+    ptuuid=$(blkid -p -o value -s PTUUID "${loop}")   # -p: probe the device, not the udev cache
     [[ -n ${ptuuid} ]] || die "No PTUUID on ${loop}"
     echo "${ptuuid}" > "${TINY_BLD}/ptuuid"
 
@@ -3777,11 +4244,14 @@ tiny_make_image() {  # tiny_make_image <rpi400|rpi3|zero2w>
 
     info "Root partition: rootfs (minus /boot, which lives on the FAT side)"
     tiny_img_mount "${loop}p2"
-    rsync -a --exclude='/boot/*' "${TINY_ROOT}/" "${TINY_MNT}/"
+    # -HAX --numeric-ids: plain -a dropped xattrs (file capabilities), ACLs and
+    # hardlinks on the way to the card although unpack had preserved them
+    rsync -aHAX --numeric-ids --exclude='/boot/*' "${TINY_ROOT}/" "${TINY_MNT}/"
     tiny_img_umount
 
     losetup -d "${loop}"
-    trap - EXIT INT TERM
+    [[ -z $(losetup -j "${TINY_IMG}") ]] || die "${TINY_IMG} is still attached to a loop device after losetup -d"
+    trap - EXIT HUP INT TERM
     echo "${board}" > "${TINY_BOARD_F}"
     if [[ -n ${SUDO_UID:-} ]]; then
         chown "${SUDO_UID}:${SUDO_GID}" "${TINY_IMG}" "${TINY_BLD}/ptuuid" "${TINY_BOARD_F}"
@@ -3814,13 +4284,78 @@ cmd_tiny_run_rpi() {
     # -snapshot: guest writes go to a temporary overlay, never to sd.img. The
     # gate boots a rootfs that generates ssh host keys on first boot; without
     # this, every card dd'ed from the image would ship the keys qemu made.
-    info "Booting sd.img for ${board} (-M ${machine}, -snapshot; OUTPUT-ONLY — quit qemu: Ctrl-A X)"
-    exec qemu-system-aarch64 -M "${machine}" -snapshot \
-        -kernel "${TINY_ROOT}/boot/kernel8.img" \
-        -dtb "${TINY_ROOT}/boot/${dtb}" \
-        -drive "file=${TINY_IMG},format=raw,if=sd" \
-        -append "console=ttyAMA1,115200 root=PARTUUID=${ptuuid}-02 rootwait rw init=${TINY_INIT}" \
-        -nographic
+    local -a qemu=(qemu-system-aarch64 -M "${machine}" -snapshot
+        -kernel "${TINY_ROOT}/boot/kernel8.img"
+        -dtb "${TINY_ROOT}/boot/${dtb}"
+        -drive "file=${TINY_IMG},format=raw,if=sd"
+        -append "console=ttyAMA1,115200 root=PARTUUID=${ptuuid}-02 rootwait rw init=${TINY_INIT}"
+        -nographic)
+
+    # Self-terminating gate. The models are output-only, so an interactive
+    # session buys nothing — but the old exec never returned: a 2026-10-09 run
+    # idled 40 min after the boot had finished and qemu had to be killed by
+    # hand. Now the console is logged, polled for a success marker, and qemu
+    # is stopped on PASS, FAIL or timeout. XSTAGE_GATE_HOLD=1 = the old
+    # behaviour (watch it, quit with Ctrl-A X).
+    local pass
+    pass=$(rpi_gate_pass_marker)
+    if [[ ${XSTAGE_GATE_HOLD:-0} == 1 || -z ${pass} ]]; then
+        [[ -n ${pass} ]] || warn "no success marker known for init ${TINY_INIT} — set XSTAGE_GATE_PASS='<ERE>' for an automatic gate"
+        info "Booting sd.img for ${board} (-M ${machine}, -snapshot; OUTPUT-ONLY — quit qemu: Ctrl-A X)"
+        exec "${qemu[@]}"
+    fi
+    local timeout="${XSTAGE_GATE_TIMEOUT:-900}"
+    local fail='Kernel panic|end Kernel panic|You are in emergency mode|Entering emergency mode|Failed to mount /sysroot|Cannot open root device|VFS: Unable to mount root'
+    local log="${TINY_BLD}/gate-$(date +%Y%m%d-%H%M%S).log"
+    info "Gate: sd.img for ${board} (-M ${machine}, -snapshot), timeout ${timeout}s, PASS on /${pass}/"
+    info "Console log: ${log}"
+    # stdin from /dev/null: a backgrounded -nographic qemu must not read the tty
+    "${qemu[@]}" </dev/null >"${log}" 2>&1 &
+    local qpid=$!
+    trap 'kill "${qpid}" 2>/dev/null; wait "${qpid}" 2>/dev/null || true' EXIT INT TERM
+    local t=0 verdict="" tailpos=1
+    while (( t < timeout )); do
+        sleep 5; t=$(( t + 5 ))
+        # stream new console lines so the operator still sees the boot
+        tail -n +"${tailpos}" "${log}" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g'
+        tailpos=$(( $(wc -l <"${log}") + 1 ))
+        if grep -qE "${fail}" "${log}"; then verdict=FAIL; break; fi
+        if grep -qE "${pass}" "${log}"; then sleep 10; verdict=PASS; break; fi   # let late units log
+        kill -0 "${qpid}" 2>/dev/null || { verdict=FAIL; warn "qemu exited on its own"; break; }
+    done
+    kill "${qpid}" 2>/dev/null || true; wait "${qpid}" 2>/dev/null || true   # 143 = our SIGTERM
+    trap - EXIT HUP INT TERM
+    [[ -n ${SUDO_UID:-} ]] && chown "${SUDO_UID}:${SUDO_GID}" "${log}"
+    local failed
+    failed=$(sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' "${log}" | grep -oE 'Failed to start .*' | sort -u || true)
+    echo
+    [[ -n ${failed} ]] && { warn "units that failed during boot:"; printf '    %s\n' "${failed}"; }
+    case ${verdict} in
+        PASS) info "GATE PASS after ${t}s (/${pass}/ seen) — log ${log}" ;;
+        FAIL) die "GATE FAIL after ${t}s — see ${log}" ;;
+        *)    die "GATE TIMEOUT: /${pass}/ not seen within ${timeout}s — see ${log} (raise XSTAGE_GATE_TIMEOUT if the boot is just slow)" ;;
+    esac
+}
+
+# Success marker for the self-terminating run-rpi gate, from the rootfs's init:
+# systemd → its default target (graphical when the image boots a desktop),
+# OpenRC → the 'local' service, the last one in the default runlevel. A tiny
+# custom /init has no generic marker: the gate then falls back to the old
+# watch-and-quit mode unless XSTAGE_GATE_PASS names one.
+rpi_gate_pass_marker() {
+    if [[ -n ${XSTAGE_GATE_PASS:-} ]]; then echo "${XSTAGE_GATE_PASS}"; return; fi
+    case ${TINY_INIT} in
+        */systemd)
+            if [[ $(readlink "${TINY_ROOT}/etc/systemd/system/default.target" 2>/dev/null) == *graphical.target ]]; then
+                echo 'Reached target .*Graphical Interface'
+            else
+                echo 'Reached target .*Multi-User System'
+            fi ;;
+        */openrc-init|/sbin/init|*/init.sysv)
+            # not "[[ ]] && echo": as the last statement of a $(…) function a
+            # false test returned 1 and set -e killed run-rpi silently
+            if [[ -x ${TINY_ROOT}/sbin/openrc ]]; then echo 'Starting local'; fi ;;
+    esac
 }
 
 cmd_tiny_sd() {
@@ -3833,8 +4368,8 @@ cmd_tiny_sd() {
     [[ -b ${dev} ]] || die "Block device not found: ${dev}"
     local name="${dev#/dev/}"
     # never a disk that holds a mounted / (covers LUKS/LVM via the child tree)
-    lsblk -no MOUNTPOINTS "${dev}" | grep -qx / &&
-        die "${dev} holds the root filesystem — refusing"
+    local mps; mps=$(lsblk -no MOUNTPOINTS "${dev}")
+    grep -qx / <<<"${mps}" && die "${dev} holds the root filesystem — refusing"
     local removable idbus tran model size
     removable=$(cat "/sys/block/${name}/removable" 2>/dev/null || echo 0)
     idbus=$(udevadm info --query=property --name="${dev}" | { grep '^ID_BUS=' || true; } | cut -d= -f2)
@@ -3855,6 +4390,10 @@ cmd_tiny_sd() {
     for p in "${dev}"?*; do
         [[ -b ${p} ]] && umount "${p}" 2>/dev/null || true
     done
+    # a partition that would not umount (busy) must not be dd'd over
+    local still; still=$(lsblk -nro NAME,MOUNTPOINTS "${dev}" | awk 'NF > 1')
+    [[ -z ${still} ]] || die "${dev} still has mounted partitions:
+${still}"
     dd if="${TINY_IMG}" of="${dev}" bs=8M conv=fsync status=progress
     sync; partprobe "${dev}" 2>/dev/null || true
     lsblk -o NAME,SIZE,FSTYPE,LABEL "${dev}"
@@ -3913,6 +4452,7 @@ tiny_status() {
 
 cmd_tiny_clean() {
     confirm "Remove ${TINY_BLD}?"
+    no_mounts_under "${TINY_BLD}"
     command rm -rf "${TINY_BLD}"
     info "Cleaned tiny."
 }
@@ -4121,6 +4661,48 @@ cmd_arm64_conf() {
             warn "PROF_BOARD_OVERLAY_DIR names '${ovdir}' but ${ov} does not exist"
         fi
     done
+    arm64_iptables_backend
+}
+
+# The hardened layer ships a default-deny ruleset for iptables-restore.service,
+# and iptables defaults to the LEGACY xtables backend. The Raspberry Pi vendor
+# kernels (6.18) build no legacy ip_tables/iptable_filter at all — only
+# nf_tables + nft_compat — so both restores failed at boot and the card came up
+# with NO firewall (rpi400kde gate, 2026-10-09; it was logged as a "known"
+# first-boot failure). Pick the backend from what the image's kernels provide:
+# legacy only if EVERY installed kernel has ip_tables (we cannot know which one
+# the board boots), otherwise nft. eselect runs host-side on the foreign root
+# (ROOT=), no qemu. The same ruleset loads unchanged through iptables-nft.
+arm64_iptables_backend() {
+    local rules="${TINY_ROOT}/var/lib/iptables/rules-save"
+    [[ -s ${rules} ]] || return 0
+    local kdir legacy=1 nft=1 any=0
+    for kdir in "${TINY_ROOT}"/lib/modules/*/; do
+        [[ -f ${kdir}modules.dep ]] || continue
+        any=1
+        grep -qE '(^|/)ip_tables\.ko' "${kdir}modules.dep" ||
+            grep -qE '(^|/)ip_tables\.ko' "${kdir}modules.builtin" 2>/dev/null || legacy=0
+        { grep -qE '(^|/)nf_tables\.ko' "${kdir}modules.dep" ||
+            grep -qE '(^|/)nf_tables\.ko' "${kdir}modules.builtin" 2>/dev/null; } &&
+        { grep -qE '(^|/)nft_compat\.ko' "${kdir}modules.dep" ||
+            grep -qE '(^|/)nft_compat\.ko' "${kdir}modules.builtin" 2>/dev/null; } || nft=0
+    done
+    if (( ! any )); then
+        warn "iptables ruleset present but no /lib/modules/*/modules.dep — backend left as is"
+        return 0
+    fi
+    (( legacy )) && { info "iptables backend: legacy (every kernel has ip_tables)"; return 0; }
+    (( nft )) || die "no kernel in the image has legacy ip_tables, and not every one has" \
+        "nf_tables + nft_compat — iptables-restore would fail and the board boot with NO firewall"
+    [[ -x ${TINY_ROOT}/usr/bin/xtables-nft-multi ]] ||
+        die "kernels lack legacy ip_tables but xtables-nft-multi is missing (net-firewall/iptables USE=nftables)"
+    ROOT="${TINY_ROOT}" eselect iptables set xtables-nft-multi ||
+        die "eselect iptables set xtables-nft-multi failed on ${TINY_ROOT}"
+    local cur
+    cur=$(readlink "${TINY_ROOT}/usr/sbin/iptables-restore")
+    [[ ${cur##*/} == xtables-nft-multi ]] ||
+        die "iptables-restore still points at '${cur}' after eselect"
+    info "iptables backend: nft (a kernel lacks legacy ip_tables; ruleset loads via nft_compat)"
 }
 
 # The desktop half of arm64_configure — a non-root user, sddm autologin,
@@ -4147,15 +4729,33 @@ arm64_configure_desktop() {  # arm64_configure_desktop <password-hash>
         fi
         # Every group the image defines, not a hand-picked list (user rule
         # 2026-08-06) — same policy as the live images: root and the two
-        # no-privilege groups are skipped.
-        local g glist=""
+        # no-privilege groups are skipped, and a hardened profile also skips
+        # XSTAGE_ROOT_EQUIV_GROUPS.
+        local g glist="" skip=" root nogroup nobody ${user} "
+        if [[ ${PROFILE} == *hardened* ]]; then
+            skip+="${XSTAGE_ROOT_EQUIV_GROUPS} "
+            info "Hardened profile — ${user} kept out of: ${XSTAGE_ROOT_EQUIV_GROUPS}"
+        fi
         while IFS=: read -r g _; do
-            case ${g} in root|nogroup|nobody|"${user}") continue ;; esac
+            case ${skip} in *" ${g} "*) continue ;; esac
             glist+="${g},"
         done < "${TINY_ROOT}/etc/group"
         [[ -z ${glist} ]] ||
             usermod --prefix "${TINY_ROOT}" -aG "${glist%,}" "${user}" ||
             die "usermod -aG failed for ${user}"
+        # -aG only adds: a rootfs configured before the hardened exclusion
+        # keeps those groups unless they are removed explicitly
+        if [[ ${PROFILE} == *hardened* ]]; then
+            local dlist=""
+            for g in ${XSTAGE_ROOT_EQUIV_GROUPS}; do
+                if grep -qE "^${g}:[^:]*:[^:]*:(.*,)?${user}(,|\$)" "${TINY_ROOT}/etc/group"; then
+                    dlist+="${g},"
+                fi
+            done
+            [[ -z ${dlist} ]] ||
+                usermod --prefix "${TINY_ROOT}" -rG "${dlist%,}" "${user}" ||
+                die "usermod -rG failed for ${user}"
+        fi
 
         # sddm needs BOTH keys (User= alone is silently ignored); Session is a
         # .desktop NAME resolved from the session command, Wayland first.
@@ -4193,7 +4793,9 @@ arm64_configure_desktop() {  # arm64_configure_desktop <password-hash>
         # same policy and same rationale as the live images (user decision
         # 2026-08-06). visudo validates on the host: a syntax error here locks
         # sudo out and would only surface on the booted card.
-        if [[ -x ${TINY_ROOT}/usr/bin/sudo ]]; then
+        if [[ -x ${TINY_ROOT}/usr/bin/sudo && ${PROFILE} == *hardened* ]]; then
+            install_hardened_sudoers "${TINY_ROOT}" "${user}"
+        elif [[ -x ${TINY_ROOT}/usr/bin/sudo ]]; then
             install -d -m 0755 "${TINY_ROOT}/etc/sudoers.d"
             cat > "${TINY_ROOT}/etc/sudoers.d/95-xstage-desktop" <<-EOF
 	%wheel ALL=(ALL:ALL) NOPASSWD: ALL
@@ -4269,7 +4871,9 @@ arm64_configure() {
     # root password: the same host-side hash trick as the tiny ssh images
     local hash
     hash=$(openssl passwd -6 "${ZERO_PASS}") || die "openssl passwd failed"
-    sed -i "s|^root:[^:]*:|root:${hash}:|" "${TINY_ROOT}/etc/shadow" ||
+    # sed exits 0 on NO match (no root line, odd format) — verify the result
+    sed -i "s|^root:[^:]*:|root:${hash}:|" "${TINY_ROOT}/etc/shadow" &&
+        grep -q "^root:${hash}:" "${TINY_ROOT}/etc/shadow" ||
         die "could not set the root password in ${TINY_ROOT}/etc/shadow"
 
     # ssh: root login + the invoker's key; host keys are generated by the
@@ -4311,17 +4915,29 @@ arm64_configure() {
 		dns_servers_${ETH_IF}="${ETH_DNS}"
 		EOF
         if [[ ${BOARD} == zero ]]; then
-            # WiFi prepared, not enabled: wpa_supplicant + the brcmfmac43436
-            # firmware are in the image and the credential template ships via
-            # the 'zero' overlay layer — filling it in and uncommenting this
-            # stanza happens on the running board, never in the image
+            # WiFi prepared, not enabled: wpa_supplicant, the brcmfmac43436
+            # firmware for the onboard radio and the mt7662 pair for the
+            # CF-922AC USB stick are all in the image, and the credential
+            # template ships via the 'zero' overlay layer — filling it in and
+            # uncommenting a stanza happens on the running board, never in the
+            # image. Two radios, so two stanzas:
+            #   wlan0   onboard brcmfmac43436, 2.4 GHz only
+            #   wlanac  COMFAST CF-922AC (MT7612U) on USB, 2.4 + 5 GHz, held
+            #           at that name by the layer's 70-cf922ac.rules
+            # The stick needs the data port in HOST role, which rules out the
+            # g_ether gadget on ${ETH_IF} at the same time — the Zero 2 W has
+            # exactly one data port. See genstage/rpi/config-zero.txt.
             cat >> "${TINY_ROOT}/etc/conf.d/net" <<-EOF
 
 		# WiFi — fill /etc/wpa_supplicant/wpa_supplicant.conf first, then
-		# uncomment and: ln -s net.lo /etc/init.d/net.wlan0 &&
-		#                rc-update add net.wlan0 default
+		# uncomment ONE pair and: ln -s net.lo /etc/init.d/net.<iface> &&
+		#                         rc-update add net.<iface> default
+		# onboard brcmfmac43436 (2.4 GHz)
 		#modules_wlan0="wpa_supplicant"
 		#config_wlan0="dhcp"
+		# COMFAST CF-922AC / MT7612U on USB (2.4 + 5 GHz)
+		#modules_wlanac="wpa_supplicant"
+		#config_wlanac="dhcp"
 		EOF
         fi
         ln -snf net.lo "${TINY_ROOT}/etc/init.d/net.${ETH_IF}"
@@ -4374,6 +4990,7 @@ arm64_status() {
 
 cmd_arm64_clean() {
     confirm "Remove ${TINY_BLD}?"
+    no_mounts_under "${TINY_BLD}"
     command rm -rf "${TINY_BLD}"
     info "Cleaned arm64."
 }
@@ -4393,6 +5010,8 @@ cmd_clean_all() {
     # (PROF_BUILD_SUBDIR=arm64sd-<name>)
     local blddir; blddir="$(dirname "${TINY_BLD}")"
     confirm "Clean ALL tracks (catalyst tmp + ${TINY_BLD} + ${blddir}/arm64sd*)?"
+    local t
+    for t in "${STOREDIR}/tmp" "${TINY_BLD}" "${blddir}"/arm64sd*; do no_mounts_under "${t}"; done
     command rm -rf "${STOREDIR}/tmp" "${TINY_BLD}" "${blddir}"/arm64sd*
     info "Cleaned all."
 }
@@ -4410,8 +5029,56 @@ case "$1" in
     clean)          cmd_clean_all; exit 0 ;;
 esac
 
+XSTAGE_ARGV=("$@")
 TGT="$1"; shift
 CMD="${1:-status}"; shift || true
+
+# --- session namespaces (2026-11-13) -----------------------------------------
+# Every amd64 verb that enters the image chroot re-executes itself once inside
+# its own mount, UTS and IPC namespaces (same PID: unshare execs in place, the
+# xp run lock fd is inherited):
+#   mount  every bind of live_chroot exists only in this namespace. The kernel
+#          drops them when the last process of the session exits, so SIGKILL,
+#          a closed terminal or a Ctrl-C between two mounts cannot leak onto
+#          the host, and nothing can propagate back to the host's /sys peers
+#          (2026-11-08). Propagation is 'slave': host mount events still arrive.
+#   uts    the session runs under the IMAGE's hostname, so a package that
+#          records its build host (the kernel: "root@host" in /proc/version)
+#          does not carry this machine's name into a shipped image.
+#   ipc    SysV IPC and POSIX queues of the build are not the host's.
+# No PID namespace on purpose: xstage would be PID 1 in it, bash as init
+# ignores INT/TERM outside a trap ("Ctrl-C does nothing"), and the host /proc
+# checks (reap, foreign-session guard, status) would go blind.
+# The mount/umount helpers and traps stay: they keep the normal path
+# deterministic and still report a process that holds a bind.
+# XSTAGE_NO_NS=1 keeps the old single-namespace behaviour (expert escape).
+ns_verb() {
+    case "$1" in
+        conf|pkgs|restrict-run|configure|kernel|rmkernel|squash|live|live-enter|live-emerge) return 0 ;;
+    esac
+    return 1
+}
+# true only when this process really is outside the host's mount namespace -
+# the env marker alone could be inherited or set by hand
+in_session_ns() {
+    [[ -n ${XSTAGE_IN_NS:-} ]] || return 1
+    [[ $(readlink /proc/self/ns/mnt 2>/dev/null) != "$(readlink /proc/1/ns/mnt 2>/dev/null)" ]]
+}
+if [[ ${TGT} == amd64 && ${EUID} -eq 0 && -z ${XSTAGE_NO_NS:-} ]] && ns_verb "${CMD}" && ! in_session_ns; then
+    need_native_profile
+    command -v unshare >/dev/null 2>&1 || die "unshare (sys-apps/util-linux) not found — install it, or run with XSTAGE_NO_NS=1"
+    # A leak left on the HOST by an older run must go here, before the
+    # namespace exists: inside it the cleanup would only remove the copy.
+    live_chroot_mounted "${LIVE_ROOT}"
+    live_chroot_umount "${LIVE_ROOT}"
+    export XSTAGE_IN_NS=1
+    XSTAGE_BUILD_HOST="$(hostname 2>/dev/null || true)"; export XSTAGE_BUILD_HOST
+    exec unshare --mount --uts --ipc --propagation slave -- "$0" "${XSTAGE_ARGV[@]}"
+fi
+if in_session_ns && [[ $(readlink /proc/self/ns/uts 2>/dev/null) != "$(readlink /proc/1/ns/uts 2>/dev/null)" ]]; then
+    hostname "${LIVE_HOSTNAME}" 2>/dev/null ||
+        warn "could not set the session hostname to '${LIVE_HOSTNAME}' — builds will record $(hostname)"
+fi
 
 case "${TGT}" in
 amd64)
@@ -4449,7 +5116,8 @@ amd64)
         usb)        need_native_profile; cmd_live_usb "$@" ;;
         live-enter) need_native_profile; cmd_live_enter "$@" ;;
         live-emerge) need_native_profile; cmd_live_emerge "$@" ;;
-        live-status) live_status ;;
+        binhost)    need_native_profile; cmd_live_binhost "$@" ;;
+        live-status) live_status "$@" ;;
         live-clean)  need_native_profile; cmd_live_clean "$@" ;;
         *)        die "Unknown amd64 subcommand: ${CMD} (see: $0 --help)" ;;
     esac ;;

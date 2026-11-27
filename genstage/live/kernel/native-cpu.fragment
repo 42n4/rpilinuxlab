@@ -1,0 +1,14 @@
+# Kconfig fragment: build the kernel with -march=native.
+#
+# Carried ONLY by the profiles whose targets are AMD Zen 3 or newer
+# (amdkdehard, nvidiahard, ryzenhard). 'native' resolves on the BUILD HOST:
+# on the Ryzen 9 5950X that is znver3, and Zen 4 / Zen 5 targets execute a
+# znver3 kernel unchanged. zen-sources 7.3 offers no named -march for the
+# kernel (only X86_NATIVE_CPU and the x86-64-v1..v3 levels), so unlike the
+# userland CFLAGS the arch cannot be written out.
+#
+# CONSEQUENCE: build these images on a host that is NOT newer than the oldest
+# target CPU. Built on a Zen 5 host the same fragment yields a znver5 kernel
+# that dies with an invalid-opcode trap on Zen 3, before any log is written.
+# intelhard and corehard must never carry this file.
+CONFIG_X86_NATIVE_CPU=y

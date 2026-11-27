@@ -1,0 +1,4 @@
+# Claude Code only from ::pwr: its managed settings do not force the system
+# certificate store (see dev-util/claude-code in profiles/amdkdehard.conf).
+dev-util/claude-code::gentoo
+dev-util/claude-code::stuff

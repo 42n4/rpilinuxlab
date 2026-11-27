@@ -1,0 +1,6 @@
+# Profile-guided build of the interpreter Portage and every Python tool run on.
+# Measured on the host 2026-11-20: emerge -pe @world 18.7 s -> 17.5 s (about 6-7 %),
+# same merge list. Build cost: a few minutes per slot (the profile run is a
+# subset of the test suite). Cross profiles cannot use it: the profile run
+# executes the freshly built target interpreter.
+dev-lang/python pgo

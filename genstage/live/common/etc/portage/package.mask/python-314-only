@@ -1,0 +1,5 @@
+# One Python: 3.14 is the only PYTHON_TARGET. 3.15 was installed only because
+# packages that need "any Python" at build time pick the newest one present
+# (2026-11-20: 23 such holders on the host, none targets it). Remove this file
+# to move to 3.15 together with PYTHON_TARGETS.
+>=dev-lang/python-3.15

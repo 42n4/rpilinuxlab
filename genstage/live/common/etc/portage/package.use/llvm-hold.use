@@ -1,0 +1,8 @@
+# Companion of package.mask/llvm-hold: LLVM stays at slot 22.
+# llvm-r1.eclass turns on llvm_slot_<newest stable> by default for every package whose LLVM_COMPAT
+# lists it. Once that became 23, bpftool, bcc, qttools 6.12, postgresql and others asked for
+# clang:23, which the mask refuses ("All ebuilds that could satisfy llvm-core/clang:23 have been
+# masked"; with qttools unresolved the whole Qt set then shows as a slot conflict).
+# A flag a package does not have is ignored, so this only moves packages that accept both slots.
+# Remove together with the mask.
+*/* LLVM_SLOT: -23 22

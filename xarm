@@ -22,7 +22,7 @@
 #   chroot [CMD]     QEMU user chroot into sysroot (mounts + trap umount)
 #   1by1 [--fresh] ARGS  resolve deps (any emerge args, e.g. -e @world), build each
 #                    package --nodeps: cross first, fall back to qemu chroot;
-#                    logs in /var/tmp/xarm/ (done.log: atom<TAB>mode<TAB>secs);
+#                    logs in /var/tmp/xarm/ (done.<profile>.<cpu>.log: atom<TAB>mode<TAB>secs);
 #                    --fresh rotates previous logs first
 #   binhost [PORT]   serve sysroot binpkgs over HTTP for the Pi (default 8686)
 #   distcc start|stop|status  host distccd on loopback (compile offload for the
@@ -118,7 +118,22 @@ warn()    { echo "⚠️   $*" >&2; }
 confirm() { read -r -p "$1 [yes/NO]: " ans; [[ "$ans" == "yes" ]] || die "Aborted."; }
 help()   { sed -n '2,/^set /p' "$0" | grep '^#' | sed 's/^# \?//'; }
 
-need_root() { [[ $EUID -eq 0 ]] || die "Root required: sudo $0 $CMD"; }
+need_root() {
+    # the variable goes AFTER sudo: "XPROFILE=x sudo xarm" sets it for sudo
+    # only and env_reset drops it (2026-10-11: a bare tune then wiped all 26
+    # xprofile-* fragments)
+    [[ $EUID -eq 0 ]] || die "Root required: sudo${XPROFILE:+ XPROFILE=${XPROFILE}} $0 $CMD"
+}
+
+# tune/setup rewrite the sysroot for the ACTIVE profile and delete the previous
+# profile's xprofile-* fragments + savedconfig. Without XPROFILE that "active
+# profile" is the bare arm64/23.0 default — a silent downgrade of a desktop
+# sysroot, usually because sudo's env_reset ate the variable. Refuse unless
+# the caller says the bare profile is what they want.
+need_xprofile() {
+    [[ -n ${XPROFILE:-}${XPROFILE_FILE:-}${XARM_BARE:-} ]] ||
+        die "No XPROFILE — this would retune the sysroot to the bare ${PROFILE} and delete every xprofile-* fragment. Run: sudo XPROFILE=<prof> $0 $CMD   (XARM_BARE=1 forces the bare profile)"
+}
 
 need_toolchain() {
     command -v "${TARGET}-gcc" >/dev/null 2>&1 ||
@@ -228,9 +243,18 @@ sysroot_write_makeconf() {
     if grep -q "^# xarm settings" "${mc}" && ! grep -q "^# >>> xarm managed" "${mc}"; then
         sed -i '/^# xarm settings/,$d' "${mc}"
     fi
-    sed -i '/^# >>> xarm managed/,/^# <<< xarm managed/d' "${mc}"
+    # both markers or neither: a start marker without its end (an interrupted
+    # earlier write) would make the range delete eat everything to EOF
+    if grep -q "^# >>> xarm managed" "${mc}" && ! grep -q "^# <<< xarm managed" "${mc}"; then
+        die "${mc}: '# >>> xarm managed' without its '# <<< xarm managed' end marker — fix by hand before rerunning"
+    fi
+    local distdir
+    distdir=$(portageq distdir) && [[ -n ${distdir} ]] || die "portageq distdir failed — refusing to write DISTDIR=\"\" into ${mc}"
+    # build the new file next to the old one and mv it into place
+    local mcnew="${mc}.new.$$"
+    sed '/^# >>> xarm managed/,/^# <<< xarm managed/d' "${mc}" > "${mcnew}"
     info "Writing managed block in ${mc} (-mtune=${CPU})"
-    cat >> "${mc}" <<-EOF
+    cat >> "${mcnew}" <<-EOF
 	# >>> xarm managed — rewritten by 'xarm setup' / 'xarm tune', do not edit inside
 	# All ARM profiles share this one sysroot: -march=armv8-a keeps every binary
 	# runnable on every ARMv8 board (Pi 3 / 400 / Zero 2 W); -mtune only changes
@@ -244,6 +268,10 @@ sysroot_write_makeconf() {
 	# binpkgs for the Pi: ROOT-relative, served by 'xarm binhost'. The name
 	# carries the profile (${PROFILE}) — see PKGDIR_NAME in xarm.
 	PKGDIR="\${ROOT}var/cache/${PKGDIR_NAME}"
+	# Share the HOST distdir. Without this line Portage falls back to its
+	# default /var/cache/distfiles, which sits on the host's root fs and
+	# outside ramstart1's bind mounts — 8.3G had piled up there by 2026-09-24.
+	DISTDIR="${distdir}"
 	FEATURES="buildpkg -news"
 	# qemu-user chroot cannot take the namespace sandboxes (Embedded Handbook)
 	FEATURES="\${FEATURES} -pid-sandbox -ipc-sandbox -network-sandbox"
@@ -272,12 +300,13 @@ sysroot_write_makeconf() {
     # xp-profile additions land inside the managed block, so the next
     # setup/tune under a different profile removes them with the rest
     if [[ -n ${USE_EXTRA} ]]; then
-        echo "# xp profile USE (XARM_USE_EXTRA)" >> "${mc}"
-        echo "USE=\"\${USE} ${USE_EXTRA}\"" >> "${mc}"
+        echo "# xp profile USE (XARM_USE_EXTRA)" >> "${mcnew}"
+        echo "USE=\"\${USE} ${USE_EXTRA}\"" >> "${mcnew}"
     fi
-    [[ -z ${VIDEO_CARDS_EXTRA} ]]   || echo "VIDEO_CARDS=\"${VIDEO_CARDS_EXTRA}\"" >> "${mc}"
-    [[ -z ${INPUT_DEVICES_EXTRA} ]] || echo "INPUT_DEVICES=\"${INPUT_DEVICES_EXTRA}\"" >> "${mc}"
-    echo "# <<< xarm managed" >> "${mc}"
+    [[ -z ${VIDEO_CARDS_EXTRA} ]]   || echo "VIDEO_CARDS=\"${VIDEO_CARDS_EXTRA}\"" >> "${mcnew}"
+    [[ -z ${INPUT_DEVICES_EXTRA} ]] || echo "INPUT_DEVICES=\"${INPUT_DEVICES_EXTRA}\"" >> "${mcnew}"
+    echo "# <<< xarm managed" >> "${mcnew}"
+    mv -f "${mcnew}" "${mc}" || die "could not replace ${mc}"
 }
 
 # Per-xp-profile portage fragments in the shared sysroot: every xprofile-*
@@ -285,7 +314,8 @@ sysroot_write_makeconf() {
 # an etc/portage tree) are copied in as xprofile-<basename>. A profile that
 # sets no confdir just cleans up the previous one's files. env/ is not synced:
 # package.env fragments must reference env files the sysroot already has, or
-# the layer grows them under profile-specific names by hand.
+# the layer grows them under profile-specific names by hand. savedconfig/ is
+# the exception to the prefix rule and is handled separately below.
 sysroot_sync_portage_confdir() {
     local sub src dst f n=0
     # profile/package.provided is in the list because a cross sysroot sometimes
@@ -310,15 +340,36 @@ sysroot_sync_portage_confdir() {
             done
         fi
     done
+    # savedconfig/ is the one fragment class that cannot take the xprofile-
+    # prefix: savedconfig.eclass looks its file up by exact name — CATEGORY/PF,
+    # then CATEGORY/P, then CATEGORY/PN — so a renamed copy is simply never
+    # found and the package silently installs everything. It is also the one
+    # class nothing else writes into the sysroot: the eclass SAVES its
+    # regenerated config into the image (and from there into ROOT), never back
+    # into PORTAGE_CONFIGROOT. That makes wiping the tree on every sync safe,
+    # and it is what keeps a profile switch from leaving the previous board's
+    # trim behind — the same "rewritten, never accumulated" contract the
+    # xprofile-* files above get from their -delete.
+    local sc="${SYSROOT}/etc/portage/savedconfig"
+    [[ -n ${TARGET} && ${SYSROOT} == /usr/*-* ]] ||
+        die "refusing to touch savedconfig: SYSROOT='${SYSROOT}' does not look like a crossdev sysroot"
+    command rm -rf "${sc}"
+    local sn=0
+    if [[ -n ${PORTAGE_CONFDIR} && -d ${PORTAGE_CONFDIR}/savedconfig ]]; then
+        mkdir -p "${sc}"
+        command cp -a "${PORTAGE_CONFDIR}/savedconfig/." "${sc}/"
+        sn=$(find "${sc}" -type f | wc -l)
+    fi
     if [[ -n ${PORTAGE_CONFDIR} ]]; then
         [[ -d ${PORTAGE_CONFDIR} ]] ||
             die "XARM_PORTAGE_CONFDIR=${PORTAGE_CONFDIR}: not a directory"
-        info "Synced ${n} xprofile-* fragment(s) from ${PORTAGE_CONFDIR}"
+        info "Synced ${n} xprofile-* fragment(s) + ${sn} savedconfig file(s) from ${PORTAGE_CONFDIR}"
     fi
 }
 
 cmd_tune() {
     need_root
+    need_xprofile
     # Like the fragment sync below, this follows the CURRENT XPROFILE (or the
     # default) — a bare 'tune' flips a desktop-flavoured sysroot back to plain
     # arm64/23.0. Without this, switching boards kept the previous board's
@@ -352,6 +403,7 @@ sysroot_ldconfig() {
 # ---------------------------------------------------------------------------
 cmd_setup() {
     need_root
+    need_xprofile
     command -v crossdev >/dev/null || die "Install first: emerge sys-devel/crossdev"
     [[ -x ${QEMU_BIN} ]] || die "No static ${QEMU_BIN} — emerge qemu with USE=static-user QEMU_USER_TARGETS=aarch64"
     file "${QEMU_BIN}" | grep -q "statically linked" ||
@@ -469,18 +521,20 @@ cmd_setup() {
         if grep -q " ${SYSROOT}/" /proc/mounts; then
             die "Mounts active under ${SYSROOT} — umount before usr-merge"
         fi
+        # every step chained with && on purpose: inside "( set -e; … ) || die"
+        # bash IGNORES -e (it is off for any command of an AND-OR list except
+        # the last), so a failed cp -a (ENOSPC) would be followed by the rm -rf
+        # of the real toolchain dirs
         (
-            set -e; cd "${SYSROOT}"
-            cp -a bin/.  usr/bin/;  rm -rf bin;  ln -s usr/bin  bin
-            cp -a sbin/. usr/bin/;  rm -rf sbin; ln -s usr/bin  sbin
-            cp -a lib/.  usr/lib/;  rm -rf lib;  ln -s usr/lib  lib
-            if [[ -d lib64 && ! -L lib64 ]]; then
-                cp -a lib64/. usr/lib64/; rm -rf lib64; ln -s usr/lib64 lib64
-            fi
-            if [[ -d usr/sbin && ! -L usr/sbin ]]; then
-                cp -a usr/sbin/. usr/bin/; rm -rf usr/sbin; ln -s bin usr/sbin
-            fi
-        ) || die "sysroot usr-merge failed"
+            cd "${SYSROOT}" &&
+            cp -a bin/.  usr/bin/ && rm -rf bin  && ln -s usr/bin bin  &&
+            cp -a sbin/. usr/bin/ && rm -rf sbin && ln -s usr/bin sbin &&
+            cp -a lib/.  usr/lib/ && rm -rf lib  && ln -s usr/lib lib  &&
+            { [[ ! -d lib64 || -L lib64 ]] ||
+              { cp -a lib64/. usr/lib64/ && rm -rf lib64 && ln -s usr/lib64 lib64; }; } &&
+            { [[ ! -d usr/sbin || -L usr/sbin ]] ||
+              { cp -a usr/sbin/. usr/bin/ && rm -rf usr/sbin && ln -s bin usr/sbin; }; }
+        ) || die "sysroot usr-merge failed — check ${SYSROOT}/{bin,sbin,lib,lib64} by hand before retrying"
     fi
     # The guard above only fires when the split dirs EXIST — a fresh crossdev
     # sysroot has no /bin at all, and the first package that installs into it
@@ -489,13 +543,13 @@ cmd_setup() {
     # right after bzip2 seeded /bin). Pre-create the merged layout so that
     # can never happen.
     (
-        set -e; cd "${SYSROOT}"
-        mkdir -p usr/bin usr/lib usr/lib64
-        [[ -e bin   ]] || ln -s usr/bin   bin
-        [[ -e sbin  ]] || ln -s usr/bin   sbin
-        [[ -e lib   ]] || ln -s usr/lib   lib
-        [[ -e lib64 ]] || ln -s usr/lib64 lib64
-        [[ -e usr/sbin ]] || ln -s bin usr/sbin
+        cd "${SYSROOT}" &&
+        mkdir -p usr/bin usr/lib usr/lib64 &&
+        { [[ -e bin   ]] || ln -s usr/bin   bin;   } &&
+        { [[ -e sbin  ]] || ln -s usr/bin   sbin;  } &&
+        { [[ -e lib   ]] || ln -s usr/lib   lib;   } &&
+        { [[ -e lib64 ]] || ln -s usr/lib64 lib64; } &&
+        { [[ -e usr/sbin ]] || ln -s bin usr/sbin; }
     ) || die "sysroot merged-usr symlink seed failed"
 
     # 2b-3. rust std for the target — dev-lang/rust-bin ships only the HOST
@@ -511,12 +565,17 @@ cmd_setup() {
         if [[ -n ${rust_ver} && -d ${rustlib} && ! -d ${rustlib}/${TARGET} ]]; then
             info "Installing rust-std ${rust_ver} for ${TARGET} (static.rust-lang.org)"
             rtmp=$(mktemp -d)
-            ( set -e; cd "${rtmp}"
-              curl -fsSO "https://static.rust-lang.org/dist/rust-std-${rust_ver}-${TARGET}.tar.xz"
-              tar xf "rust-std-${rust_ver}-${TARGET}.tar.xz"
+            # && chain + copy-then-rename: a truncated cp -a would leave
+            # ${rustlib}/${TARGET} half-filled and the "! -d" guard above
+            # would never retry
+            ( cd "${rtmp}" &&
+              curl -fsSO "https://static.rust-lang.org/dist/rust-std-${rust_ver}-${TARGET}.tar.xz" &&
+              tar xf "rust-std-${rust_ver}-${TARGET}.tar.xz" &&
               cp -a "rust-std-${rust_ver}-${TARGET}/rust-std-${TARGET}/lib/rustlib/${TARGET}" \
-                    "${rustlib}/"
-            ) || warn "rust-std install failed — cargo packages will NOT cross-build"
+                    "${rustlib}/.${TARGET}.partial" &&
+              mv "${rustlib}/.${TARGET}.partial" "${rustlib}/${TARGET}"
+            ) || { rm -rf "${rustlib}/.${TARGET}.partial"
+                   warn "rust-std install failed — cargo packages will NOT cross-build"; }
             rm -rf "${rtmp}"
         fi
     fi
@@ -530,7 +589,9 @@ cmd_setup() {
     # symlinks: an absolute link would be re-resolved inside the prefix.
     local gcclibdir
     gcclibdir=$(dirname "$("${TARGET}-gcc" -print-file-name=libgcc_s.so.1 2>/dev/null)")
-    if [[ -d ${gcclibdir} ]]; then
+    # not found → gcc echoes the bare name, dirname gives "." and the loop
+    # below would copy ./*.so.* from the caller's cwd into the sysroot
+    if [[ ${gcclibdir} == /* && -d ${gcclibdir} ]]; then
         local so n=0
         mkdir -p "${SYSROOT}/usr/lib64"
         for so in "${gcclibdir}"/*.so.[0-9]*; do
@@ -668,7 +729,10 @@ cmd_rootgcc() {
     want=$("${TARGET}-gcc" -dumpversion | cut -d. -f1)
     # the SELECTED compiler, not merely an installed one: gcc-config's choice is
     # what writes ld.so.conf.d, hence what the board actually loads
-    have=$(ROOT="${root}/" gcc-config -c "${TARGET}" 2>/dev/null |
+    # gcc-config -c exits 1 when nothing is selected in that ROOT — under
+    # pipefail that would kill the script here instead of reaching the
+    # "selecting nothing" branch below
+    have=$({ ROOT="${root}/" gcc-config -c "${TARGET}" 2>/dev/null || true; } |
            sed -n "s|^${TARGET}-\([0-9]\+\).*|\1|p")
 
     if [[ -z ${have} ]]; then
@@ -777,17 +841,25 @@ cmd_qca_fix() {
         info "No ${cfg} — app-crypt/qca not in the sysroot, nothing to fix"
         return 0
     fi
-    if grep -q "\"${SYSROOT}/usr/include/Qca-qt6/QtCrypto\"" "${cfg}" 2>/dev/null; then
-        info "qca cmake export already sysroot-prefixed — nothing to do"
-        return 0
+    # every per-config export (-relwithdebinfo, -release, -debug …), not just
+    # one name: the build type that qca was built with decides which exists,
+    # and an unpatched one is exactly the host-libqca link this verb exists
+    # to prevent (audit 2026-10-11)
+    local f bad=""
+    shopt -s nullglob
+    local cfgs=( "${dir}"/Qca-qt6Targets-*.cmake )
+    shopt -u nullglob
+    for f in "${cfgs[@]}"; do
+        sed -i -E "s#\"(/usr/lib64/libqca-qt6\.so[0-9.]*)\"#\"${SYSROOT}\1\"#g" "${f}"
+        grep -qE "\"/usr/lib64/libqca-qt6\.so[0-9.]*\"" "${f}" && bad+=" ${f##*/}"
+    done
+    if ! grep -q "\"${SYSROOT}/usr/include/Qca-qt6/QtCrypto\"" "${cfg}"; then
+        sed -i "s#\"/usr/include/Qca-qt6/QtCrypto\"#\"${SYSROOT}/usr/include/Qca-qt6/QtCrypto\"#" "${cfg}"
+        grep -q "\"${SYSROOT}/usr/include/Qca-qt6/QtCrypto\"" "${cfg}" ||
+            die "sed did not take on ${cfg} — check the upstream string still matches"
     fi
-    sed -i "s#\"/usr/include/Qca-qt6/QtCrypto\"#\"${SYSROOT}/usr/include/Qca-qt6/QtCrypto\"#" "${cfg}"
-    [[ -f ${rwdi} ]] && sed -i -E \
-        "s#\"(/usr/lib64/libqca-qt6\.so[0-9.]*)\"#\"${SYSROOT}\1\"#g" \
-        "${rwdi}"
-    grep -q "\"${SYSROOT}/usr/include/Qca-qt6/QtCrypto\"" "${cfg}" ||
-        die "sed did not take on ${cfg} — check the upstream string still matches"
-    info "Patched ${dir}/*.cmake to sysroot-relative paths"
+    [[ -z ${bad} ]] || die "host-absolute libqca path still present in:${bad} — upstream export format changed?"
+    info "qca cmake export sysroot-prefixed: ${cfg##*/} + ${#cfgs[@]} per-config file(s)"
 }
 
 # ---------------------------------------------------------------------------
@@ -806,10 +878,17 @@ chroot_umount() {
 chroot_mount() {
     local tgt="${CHROOT_BASE}$2"
     mkdir -p "${tgt}"
+    # already mounted (a concurrent or leftover session) → not ours, never
+    # unmounted by us; a failed mount is fatal, cmd_chroot often runs inside
+    # an 'if' where set -e is off (audit 2026-10-11)
+    mountpoint -q "${tgt}" && return 0
     case "$1" in
-        proc)  mountpoint -q "${tgt}" || mount -t proc proc "${tgt}" ;;
-        rbind) mountpoint -q "${tgt}" || { mount --rbind "$3" "${tgt}"; mount --make-rslave "${tgt}"; } ;;
-        bind)  mountpoint -q "${tgt}" || mount --bind "$3" "${tgt}" ;;
+        proc)  mount -t proc proc "${tgt}" || die "mount proc on ${tgt} failed" ;;
+        # bind + propagation in ONE mount process: a Ctrl-C delivered between
+        # two commands left the tree a shared peer of the host's /sys
+        # (xstage, 2026-11-08)
+        rbind) mount --rbind --make-rslave "$3" "${tgt}" || die "rbind $3 -> ${tgt} failed" ;;
+        bind)  mount --bind "$3" "${tgt}" || die "bind $3 -> ${tgt} failed" ;;
     esac
     MOUNTED+=("${tgt}")
 }
@@ -846,6 +925,8 @@ cmd_chroot() {
         chroot_mount bind /var/db/repos/gentoo "${grepo}"
     fi
     chroot_mount bind  /var/cache/distfiles "${ddir}"
+    # the sysroot make.conf names the host DISTDIR path — make it valid inside too
+    [[ ${ddir} == /var/cache/distfiles ]] || chroot_mount bind "${ddir}" "${ddir}"
 
     # Portage's pid-sandbox (unshared PID namespace) breaks qemu-user: every
     # guest process dies with "qemu: qemu_thread_create: Invalid argument"
@@ -864,6 +945,13 @@ cmd_chroot() {
     fi
     chroot_umount
     trap - EXIT INT TERM
+    # the static x86 qemu is only needed while binfmt resolves it INSIDE the
+    # chroot; left behind it ships on the SD card (7 MB, found in the
+    # rpi400kde rootfs 2026-10-11). Only our own copy is removed.
+    if [[ -f ${CHROOT_BASE}/usr/bin/$(basename "${QEMU_BIN}") ]] &&
+       cmp -s "${QEMU_BIN}" "${CHROOT_BASE}/usr/bin/$(basename "${QEMU_BIN}")"; then
+        command rm -f "${CHROOT_BASE}/usr/bin/$(basename "${QEMU_BIN}")"
+    fi
     return "${rc}"
 }
 
@@ -876,7 +964,10 @@ cmd_1by1() {
     [[ ${1:-} == --fresh ]] && { fresh=1; shift; }
     [[ $# -gt 0 ]] || die "Usage: xarm 1by1 [--fresh] <emerge-args|@set> (e.g. @system, -e @world)"
     mkdir -p "${LOGDIR}"
-    local done_log="${LOGDIR}/done.log" failed_log="${LOGDIR}/failed.log" chroot_log="${LOGDIR}/via-chroot.log"
+    # per profile + tune: a shared done.log said "already done, skipping" for
+    # atoms built for a DIFFERENT sysroot profile (or before a sysroot wipe)
+    local tag="${PKGDIR_NAME#binpkgs-}.${CPU}"
+    local done_log="${LOGDIR}/done.${tag}.log" failed_log="${LOGDIR}/failed.${tag}.log" chroot_log="${LOGDIR}/via-chroot.${tag}.log"
     if [[ ${fresh} -eq 1 ]]; then
         local stamp f; stamp=$(date +%Y%m%d-%H%M%S)
         for f in "${done_log}" "${failed_log}" "${chroot_log}"; do
@@ -950,7 +1041,7 @@ cmd_binhost() {
     echo "  priority = 10"
     echo
     echo "Then: emerge --getbinpkg --usepkg <pkg>    (Ctrl-C here to stop serving)"
-    exec python3 -m http.server --directory "${pkgdir}" "${port}"
+    exec python3 -m http.server --bind "${ip}" --directory "${pkgdir}" "${port}"
 }
 
 # ---------------------------------------------------------------------------
@@ -1000,7 +1091,10 @@ cmd_distcc() {
         local hostv targetv
         hostv=$("${TARGET}-gcc" -dumpversion | cut -d. -f1)
         targetv=$(chroot "${root}" /usr/bin/gcc -dumpversion 2>/dev/null | cut -d. -f1 || true)
-        [[ -z ${targetv} || ${hostv} == "${targetv}" ]] ||
+        # empty used to PASS the guard (no gcc in the chroot, or binfmt not
+        # registered) — the one case the parity check exists for
+        [[ -n ${targetv} ]] || die "cannot read the chroot's gcc version (${root}/usr/bin/gcc missing, or qemu binfmt not registered) — refusing to set up distcc blind"
+        [[ ${hostv} == "${targetv}" ]] ||
             die "gcc major mismatch: cross ${hostv} vs chroot ${targetv}"
         # masquerade fix: plain cc/gcc/g++/c++ must travel as ${TARGET}-* names,
         # or the host distccd would run its native x86_64 gcc (wrong objects)
@@ -1078,9 +1172,36 @@ cmd_clean() {
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
+XARM_ARGV=("$@")
 CMD="${1:-}"
 [[ -n ${CMD} ]] || { help; exit 0; }
 shift
+
+# --- session namespaces (2026-11-13, same design as genstage/xstage) ---------
+# The two verbs that enter the qemu chroot re-execute themselves once inside
+# their own mount, UTS and IPC namespaces (same PID, unshare execs in place):
+# the binds of chroot_mount then exist only for this session and the kernel
+# drops them when its last process exits, so a kill or a closed terminal
+# cannot leak mounts onto the host; with XPROFILE set the session runs under
+# the profile's name, so a package that records its build host does not carry
+# this machine's name onto the card. No PID namespace: bash as PID 1 ignores
+# INT/TERM outside a trap, and qemu-user already forces -pid-sandbox.
+# XARM_NO_NS=1 keeps the old single-namespace behaviour.
+in_session_ns() {
+    [[ -n ${XARM_IN_NS:-} ]] || return 1
+    [[ $(readlink /proc/self/ns/mnt 2>/dev/null) != "$(readlink /proc/1/ns/mnt 2>/dev/null)" ]]
+}
+if [[ ${EUID} -eq 0 && -z ${XARM_NO_NS:-} ]] && [[ ${CMD} == chroot || ${CMD} == 1by1 ]] && ! in_session_ns; then
+    if command -v unshare >/dev/null 2>&1; then
+        export XARM_IN_NS=1
+        exec unshare --mount --uts --ipc --propagation slave -- "$0" "${XARM_ARGV[@]}"
+    fi
+    warn "unshare (sys-apps/util-linux) not found — '${CMD}' runs in the host's mount namespace"
+fi
+if in_session_ns && [[ -n ${XPROFILE:-} ]] &&
+   [[ $(readlink /proc/self/ns/uts 2>/dev/null) != "$(readlink /proc/1/ns/uts 2>/dev/null)" ]]; then
+    hostname "${XPROFILE}" 2>/dev/null || warn "could not set the session hostname to '${XPROFILE}'"
+fi
 
 case "${CMD}" in
     setup)          cmd_setup "$@" ;;

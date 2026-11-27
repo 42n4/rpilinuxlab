@@ -40,6 +40,12 @@
 #                   when the sysroot already has a completed build in it
 #                   (see rpilinuxlab/crosscompile skill for why)         [root]
 #   pkgs            cross-emerge $PROF_PKGS into the profile rootfs     [root]
+#   update [-n]     full update: sysroot, then rootfs -uDN @world + $PROF_PKGS
+#                   (xarm tune, Qt lockstep, PROF_SYSROOT_PKGS, qca-fix,
+#                   perl moved in the qemu chroot, stale :=-consumers
+#                   rebuilt explicitly; gcc + PROF_UPDATE_EXCLUDE held;
+#                   -n = stale lists + both plans)
+#                                                                       [root]
 #   conf            overlay PROF_BOARD_OVERLAY_DIR layers onto the
 #                   rootfs (also runs first inside 'image')             [root]
 #   rpi             Pi boot payload into the rootfs                     [root]
@@ -66,6 +72,8 @@
 #   livekernel      genkernel build ('kernel' alone is the xlab verb)   [root]
 #   rmkernel VER    drop one kernel from the live tree: sources package,
 #                   source tree, modules, /boot payloads       [root,confirm]
+#                   VER is the UPSTREAM version (7.2.3), not the
+#                   /lib/modules name (7.2.3-zen1-x86_64)
 #                   boards: no VER — remove the unowned /lib/modules trees
 #                   a SLOT=0 raspberrypi-image upgrade leaves  [root,confirm]
 #   squash          livecd.squashfs + sha256 + AIDE baseline            [root]
@@ -90,15 +98,25 @@
 #                   able candidate file, -a walks the reviewed file with
 #                   per-entry y/N ('yes y |' bulk-accepts). Native
 #                   profile: the live image's world; pseudo-profile 'host':
-#                   the RUNNING system's — the only verb 'host' takes.
+#                   the RUNNING system's.
 #                   Boards have no world file and are refused    [root for -i]
+#   thp [always|madvise|never]
+#                   pseudo-profile 'host' only: show or switch transparent
+#                   hugepages on the RUNNING kernel, at once and until the
+#                   next boot (the kernel default comes from
+#                   live/kernel/performance.fragment). No argument = status.
+#                   always: every large anonymous mapping (faster compiles,
+#                   slower llama.cpp CPU prompt — measured 2026-11-15);
+#                   madvise: only programs that ask for it      [root to set]
 #   run             xlab run for the profile's xlab target
 #   kernel          xlab kernel build (the QEMU lab, not the live image)
-#   binhost         serve sysroot binpkgs over HTTP (port from global.conf)
+#   binhost         serve binpkgs over HTTP: board = cross sysroot (xarm), live profile = image cache [PORT]
+#                   (live: opens PORT for the LAN in iptables while serving, closed on Ctrl-C)
 #   distcc ...      xarm distcc start|stop|status
 #
 # Auxiliary — read-only, any time:
-#   status          xarm + xstage + xlab status for the profile
+#   status [--du]   xarm + xstage + xlab status for the profile (--du adds
+#                   the rootfs size: a du over the whole image, slow)
 #   log [emerge]    follow the running catalyst build: newest package
 #                   log, or the run chroot's emerge.log                 [root]
 #   qlop [ARGS]     merge times from the run chroot's emerge.log        [root]
@@ -108,8 +126,18 @@
 #   Interactive and read-only verbs (enter, status, gate, log, qlop, run,
 #   binhost, distcc, the passthroughs) are exempt.
 #
+# Run lock: every verb that writes a tree holds an flock on
+#   <build dir>/.xp-locks/<tree>.lock while it runs (inherited by the chroot
+#   and emerge, released by the kernel with the last process). A second
+#   writing verb on the same tree is refused, naming the holder's verb, pid
+#   and start time; other trees are independent; status, log, qlop, binhost
+#   and distcc never lock. The passthroughs (xarm, xstage, xlab) lock too.
+#   Only xp locks — a direct xstage/xarm call bypasses it.
+#
 # Env:
 #   XPROFILE        active profile when no <profile> arg (export per tab)
+#   XP_NOLOCK=1     skip the run lock (expert escape: the two verbs are known
+#                   not to touch the same files)
 #   XP_LAB_DIR      lab root override; else /etc/xp.conf, else xp's own dir
 #
 # Typical flow:
@@ -172,7 +200,7 @@ case "$1" in
 esac
 
 # a profile file named like a verb would shadow it — refuse such confs
-RESERVED=" status setup enter emerge 1by1 rootgcc sysroot-prep pkgs lock unlock clean-world seed snapshot spec stage1 stage2 stage3 all verify crossstage log qlop qlog build rpi image gate run kernel livekernel rmkernel sd binhost distcc unpack conf configure restrict-run squash isolinux iso live usb xarm xstage xlab profiles help "
+RESERVED=" thp status setup enter emerge 1by1 rootgcc sysroot-prep pkgs update lock unlock clean-world seed snapshot spec stage1 stage2 stage3 all verify crossstage log qlop qlog build rpi image gate run kernel livekernel rmkernel sd binhost distcc unpack conf configure restrict-run squash isolinux iso live usb xarm xstage xlab profiles help "
 
 PROF=""
 if [[ -f ${PROFDIR}/$1.conf ]]; then
@@ -186,6 +214,22 @@ else
     [[ -f ${PROFDIR}/${PROF}.conf ]] || die "XPROFILE=${PROF}: no ${PROFDIR}/${PROF}.conf"
 fi
 VERB="$1"; shift
+
+# the verbs the header marks [root]: fail here with the right command instead
+# of inside portage or a child's "Root required: sudo xarm …" (which omits
+# the profile and the XPROFILE= the child then lacks)
+case "${VERB}" in
+    setup|seed|stage1|stage2|stage3|all|verify|crossstage|build|unpack|rootgcc|sysroot-prep|pkgs|update|conf|rpi|image|sd|lock|unlock|configure|livekernel|rmkernel|squash|isolinux|iso|usb|enter|emerge|1by1|cycle)
+        [[ $EUID -eq 0 ]] || die "Root required: sudo xp ${PROF} ${VERB}" ;;
+esac
+# global.conf takes XARM_*/XSTAGE_* from the environment first (sudo -E, a
+# root shell): say so when one is inherited, it silently beats the profile
+_inh=""
+for _v in XARM_PROFILE XARM_CPU XARM_PORTAGE_CONFDIR XARM_TARGET XARM_USE_EXTRA XSTAGE_LIVE_OVERLAY_DIR XSTAGE_BOARD_OVERLAY_DIR; do
+    [[ -n ${!_v:-} ]] && _inh+=" ${_v}=${!_v}"
+done
+[[ -z ${_inh} ]] || warn "inherited from the environment, overriding profile ${PROF}:${_inh}"
+unset _inh _v
 
 # --- apply the profile ------------------------------------------------------
 source "${PROFDIR}/global.conf"
@@ -202,8 +246,8 @@ is_host()  { [[ ${PROF_KIND} == host ]]; }
 # host-maintenance verbs may pass; everything else must die before it can
 # touch a real target
 if is_host; then
-    case "${VERB}" in clean-world) ;; *)
-        die "Profile 'host' is the running system — it takes host-maintenance verbs only (clean-world), not '${VERB}'" ;;
+    case "${VERB}" in clean-world|thp) ;; *)
+        die "Profile 'host' is the running system — it takes host-maintenance verbs only (clean-world, thp), not '${VERB}'" ;;
     esac
 fi
 need_board() { is_board || die "'${VERB}' needs a board profile — ${PROF} is native (${PROF_KIND})"; }
@@ -219,12 +263,311 @@ prof_build_dir() {
     echo "${XP_BUILD_DIR:-${XP_LAB_DIR}/build}/${sub}"
 }
 
+# --- per-tree run lock -----------------------------------------------------
+# xp has no daemon, so until 2026-10-19 nothing stopped two verbs from working
+# the same tree at once: 'conf' rewriting /etc/portage under a running 'pkgs',
+# or two 'pkgs' in one rootfs. Now every verb that writes takes an flock on
+# <build dir>/.xp-locks/<tree>.lock before it dispatches. Keyed by BUILD TREE,
+# not by profile name: board variants may share one tree, and the xlab verbs
+# of every profile with the same xlab target share build/<target>. The fd stays
+# open across exec/timed and is inherited by the child, the chroot and emerge,
+# so the lock lives exactly as long as the verb and the kernel drops it with
+# the last process — it cannot go stale. Read-only verbs (status, log, qlop,
+# binhost, distcc) never take it. XP_NOLOCK=1 skips it: the expert escape for
+# when the two verbs are known not to touch the same files.
+# Only xp locks; a direct xstage/xarm call bypasses it.
+XP_LOCK_DIR="${XP_BUILD_DIR:-${XP_LAB_DIR}/build}/.xp-locks"
+lock_key() { if is_host; then echo host; else basename "$(prof_build_dir)"; fi; }
+xp_lock() {   # xp_lock KEY — return holding KEY, or die naming who holds it
+    local key="$1" f="${XP_LOCK_DIR}/$1.lock" fd who pid
+    if [[ -n ${XP_NOLOCK:-} ]]; then warn "XP_NOLOCK: '${VERB}' runs without the ${key} run lock"; return 0; fi
+    # 1777 like /tmp: root and user verbs both create their own lock files here
+    [[ -d ${XP_LOCK_DIR} ]] || { mkdir -p "${XP_LOCK_DIR}" && chmod 1777 "${XP_LOCK_DIR}"; } 2>/dev/null || true
+    # read-write (creates the file), or read-only when the file is another
+    # user's — flock(2) needs no write access, only an open fd
+    if [[ -w ${f} || ( ! -e ${f} && -w ${XP_LOCK_DIR} ) ]]; then
+        exec {fd}<>"${f}"
+    elif [[ -r ${f} ]]; then
+        exec {fd}<"${f}"
+    else
+        warn "no access to ${f} — '${VERB}' runs without the run lock"; return 0
+    fi
+    if ! flock -n "${fd}"; then
+        who=$(head -n1 "${f}" 2>/dev/null)
+        pid=$(grep -oP 'pid \K[0-9]+' <<< "${who}" || true)
+        [[ -z ${pid} ]] || kill -0 "${pid}" 2>/dev/null || who="${who} [that run ended; a process that did not record itself holds the lock]"
+        die "${PROF}: tree '${key}' is busy${who:+ — ${who}}
+    Let it finish (or stop it) first. Read-only verbs (status, log, qlop, binhost) are not blocked.
+    XP_NOLOCK=1 skips the lock — two verbs writing one tree corrupt it, so know why before you do."
+    fi
+    [[ ! -w ${f} ]] || printf 'xp %s %s  pid %s  user %s  since %s\n' "${PROF}" "${VERB}" "$$" "${SUDO_USER:-${USER:-?}}" "$(date '+%F %T')" > "${f}"
+    XP_LOCK_FD="${fd}"   # the fd must stay open: it IS the lock (inherited by exec and children)
+    return 0
+}
+
+# rootgcc_guard ROOT — a cross-emerge COMPILES with the cross gcc and LINKS
+# against ITS libstdc++, while the binaries RUN against whatever gcc-config
+# selected inside ROOT. A major gap is invisible at build time and fatal on the
+# board ("GLIBCXX_3.4.35 not found"), so refuse rather than build something
+# unloadable. Not fixed automatically: aligning them can mean an hours-long
+# native gcc build, which must not start as a surprise inside another verb.
+rootgcc_guard() {
+    local xg rg
+    xg=$("${PROF_TUPLE}-gcc" -dumpversion 2>/dev/null | cut -d. -f1)
+    rg=$(ROOT="$1/" gcc-config -c "${PROF_TUPLE}" 2>/dev/null |
+         sed -n "s|^${PROF_TUPLE}-\([0-9]\+\).*|\1|p")
+    [[ -z ${xg} || -z ${rg} || ${xg} == "${rg}" ]] ||
+        die "$1 is on gcc-${rg}, cross toolchain is gcc-${xg} — cross-built C++ would not load on the board. Run first: sudo xp ${PROF} rootgcc"
+}
+
+# sysroot_portageq CMD ARGS — portageq against the crossdev sysroot's own
+# config (its profile, keywords and installed db), not the host's. The root
+# MUST be portageq's positional argument: with '/' there, ROOT= in the env is
+# ignored and match/best_version answer from the HOST's vardb (found
+# 2026-10-08: the host's qtwebengine showed up as a sysroot Qt module).
+sysroot_portageq() {
+    # rc 1 with nothing on stderr = no match (the callers' empty-list case);
+    # anything portage itself complains about is an error, never "nothing
+    # visible" — that silence produced the half-upgraded sysroot of 2026-10-08
+    local err rc=0 out
+    err=$(mktemp)
+    out=$(PORTAGE_CONFIGROOT="/usr/${PROF_TUPLE}" portageq "$1" "/usr/${PROF_TUPLE}/" "${@:2}" 2>"${err}") || rc=$?
+    if [[ ${rc} -ne 0 && -s ${err} ]]; then
+        cat "${err}" >&2; command rm -f "${err}"
+        die "portageq $1 failed in the sysroot (rc=${rc}) — not treating it as 'no match'"
+    fi
+    command rm -f "${err}"
+    [[ -z ${out} ]] || printf '%s\n' "${out}"
+    return "${rc}"
+}
+# stale_consumers runs python inside $(...): a traceback there can only be
+# reported through a marker file, which stale_check turns into a die
+STALE_FAIL="/var/tmp/xp.stale_consumers.failed.$$"
+stale_check() {
+    [[ ! -e ${STALE_FAIL} ]] ||
+        { command rm -f "${STALE_FAIL}"; die "stale_consumers failed (traceback above) — refusing to read that as 'nothing stale'"; }
+}
+
+# stale_consumers ROOT — "cat/pn<TAB>dep-cat/pn" for every package installed
+# in ROOT whose recorded slot-operator dependency (dep:SLOT/SUB=) no longer
+# matches the installed SUB. Portage should schedule those rebuilds itself,
+# but in a cross graph (--root-deps=rdeps, and in the sysroot) it does not:
+# it reaches for stale binpkgs or tries a downgrade, and the update dies on
+# a slot conflict or "no ebuilds to satisfy <dep>:<slot>/<OLD SUB>=" (podman
+# vs shadow 0/6, 20 Qt/KDE packages vs qtbase 6.11.1, 2026-10-08). Naming
+# them as atoms is what makes the resolver rebuild them.
+stale_consumers() {
+    command rm -f "${STALE_FAIL}"
+    python3 - "$1" <<'PYEOF' || { touch "${STALE_FAIL}"; echo "stale_consumers: python failed for $1" >&2; }
+import glob, os, re, sys
+db = sys.argv[1].rstrip("/") + "/var/db/pkg"
+def pn(pf):
+    m = re.match(r"(.+?)-(\d.*)$", pf)
+    return m.group(1) if m else pf
+inst = {}
+for d in glob.glob(db + "/*/*"):
+    cat, pf = d.split("/")[-2:]
+    try:
+        slot, _, sub = open(d + "/SLOT").read().strip().partition("/")
+    except OSError:
+        continue
+    inst.setdefault(cat + "/" + pn(pf), {})[slot] = sub or slot
+dep_re = re.compile(r"[<>=~]*([a-z0-9-]+/[A-Za-z0-9_+-]+?)(?:-\d[^\s:\[]*)?:([^\s/\[]+)/([^\s=\[]+)=")
+out = set()
+for d in glob.glob(db + "/*/*"):
+    cat, pf = d.split("/")[-2:]
+    deps = ""
+    for f in ("RDEPEND", "DEPEND"):
+        if os.path.exists(d + "/" + f):
+            deps += " " + open(d + "/" + f).read()
+    for cp, slot, sub in dep_re.findall(deps):
+        have = inst.get(cp, {}).get(slot)
+        if have and have != sub:
+            out.add((cat + "/" + pn(pf), cp))
+for me, cp in sorted(out):
+    print(me + "\t" + cp)
+PYEOF
+}
+
+# drop_held "ATOMS" "PATTERNS" — the atoms not matched by any hold pattern
+# (globs such as dev-texlive/*); a held atom named explicitly would only turn
+# into "masked by: exclude option"
+drop_held() {
+    local a p keep out=()
+    for a in $1; do
+        keep=1
+        for p in $2; do
+            # shellcheck disable=SC2053 — glob match against the hold pattern is intended
+            [[ ${a} == ${p} ]] && { keep=0; break; }
+        done
+        (( keep )) && out+=("${a}")
+    done
+    echo "${out[*]}"
+}
+
+# stale_rebuild ROOT HOLDS — rebuild what stale_consumers still lists, as a
+# pass of its own WITHOUT --update. Riding along in the -uDN @world command
+# is not enough: --update skips an atom already at its newest version, and a
+# stale :=-consumer is exactly that (dolphin, kate, pyqt6 stayed stale after
+# a clean world run, 2026-10-09). --usepkg=n: the binpkg of that same version
+# is the stale build.
+stale_rebuild() {
+    local root="$1" holds="$2" atoms rootarg=()
+    atoms=$(drop_held "$(stale_consumers "${root}" | cut -f1 | sort -u | tr '\n' ' ')" "${holds}")
+    stale_check
+    if [[ -z ${atoms// } ]]; then
+        info "${root}: no stale :=-consumers left"
+        return 0
+    fi
+    [[ ${root%/} == "/usr/${PROF_TUPLE}" ]] || rootarg=(--root="${root}" --root-deps=rdeps)
+    info "${root}: rebuilding stale :=-consumers: ${atoms}"
+    # shellcheck disable=SC2086 — word splitting of the atom list is intended
+    "${PROF_TUPLE}-emerge" "${rootarg[@]}" --oneshot --usepkg=n --buildpkg --keep-going \
+        --with-bdeps=n --ignore-built-slot-operator-deps=y --exclude "${holds}" ${atoms}
+}
+
+# perl_align ROOT — a perl subslot bump (5.42 -> 5.44) cannot happen inside a
+# cross graph: every dev-perl/*, perl-core/*, virtual/perl-* and :=-bound
+# consumer must move in the SAME transaction, and XS modules only build
+# natively. Run it as one emerge in the QEMU chroot of ROOT. No-op when perl
+# is current and nothing is bound to an old perl subslot. ROOT must carry a
+# native gcc (the sysroot and the board rootfs both do).
+perl_align() {
+    local root="$1" atoms best perl_atom=""
+    ls -d "${root}"/var/db/pkg/dev-lang/perl-[0-9]* >/dev/null 2>&1 || return 0
+    # best_visible can fail against a root's own config (the board rootfs
+    # answers rc=1, empty): then only the stale-consumer check below decides
+    best=$(PORTAGE_CONFIGROOT="${root}" portageq best_visible "${root}/" dev-lang/perl 2>/dev/null) || best=""
+    [[ -n ${best} ]] && ! PORTAGE_CONFIGROOT="${root}" portageq has_version "${root}/" "=${best}" 2>/dev/null &&
+        perl_atom="=${best}"
+    atoms=$(stale_consumers "${root}" | awk -F'\t' '$2=="dev-lang/perl"{print $1}' | sort -u | tr '\n' ' ')
+    stale_check
+    if [[ -z ${perl_atom} && -z ${atoms// } ]]; then
+        info "perl in ${root}: current, nothing bound to an old subslot"
+        return 0
+    fi
+    atoms+=" $(cd "${root}/var/db/pkg" && ls -d virtual/perl-* perl-core/* 2>/dev/null | sed -E 's/-[0-9].*//' | sort -u | tr '\n' ' ')"
+    info "perl in ${root}: ${perl_atom:-perl current} + $(wc -w <<<"${atoms}") bound packages, one transaction in the qemu chroot"
+    # NOT --update: the consumers are already at their newest version and must
+    # be REbuilt against the new perl. xarm chroot runs its arguments as
+    # bash -lc "$*", so the command goes in as ONE string.
+    # The chroot cannot use the root's make.conf as-is when it is a CROSS one
+    # (the sysroot's says ROOT=/usr/<tuple>/, CBUILD=x86_64-…,
+    # PORTAGE_TMPDIR=${ROOT}tmp/): inside the chroot that ROOT is a real
+    # directory (binutils' target dir), so the vardb looked empty (541
+    # packages planned for 60) and every ebuild died "merged-usr profile, but
+    # disk is split-usr" — ROOT=/ in the ENVIRONMENT reaches the resolver but
+    # not the ebuild phases (2026-10-09). So emerge runs on a native COPY of
+    # /etc/portage (PORTAGE_CONFIGROOT) with those lines dropped and ${ROOT}
+    # paths made absolute; the root's own config is never touched. Harmless
+    # on a native rootfs make.conf. NOT proven for the sysroot: emerge there
+    # still died on the split-usr check even with this copy (2026-10-09), so
+    # 'update' prunes the sysroot's perl modules instead (sysroot_perl_prune)
+    # and calls perl_align only for the board rootfs, whose config is native.
+    # on a native rootfs make.conf. make.profile is re-pointed absolute: its
+    # relative link (../../../../var/db/...) breaks one level deeper.
+    # /var/tmp, not /tmp: xarm chroot
+    # bind-mounts the host's /tmp over the root's.
+    local native
+    # shellcheck disable=SC2016 — expanded inside the chroot, not here
+    native='N=/var/tmp/xp-native; mkdir -p $N/etc && rm -rf $N/etc/portage && cp -a /etc/portage $N/etc/ && sed -i -E '"'"'/^[[:space:]]*(ROOT|SYSROOT|CBUILD|PORTAGE_TMPDIR)=/d; s#\$\{ROOT\}#/#g'"'"' $N/etc/portage/make.conf && echo PORTAGE_TMPDIR=/var/tmp >> $N/etc/portage/make.conf && ln -sfn "$(readlink -f /etc/portage/make.profile)" $N/etc/portage/make.profile'
+    XARM_CHROOT_ROOT="${root}" "$(xarm_bin)" chroot \
+        "${native} && PORTAGE_CONFIGROOT=/var/tmp/xp-native emerge --ignore-default-opts --oneshot --usepkg=n --keep-going ${perl_atom} ${atoms}"
+}
+
+# sysroot_perl_prune — the SYSROOT's own answer to a perl subslot bump.
+# Cross builds run the HOST's perl; dev-perl/*, perl-core/* and virtual/perl-*
+# land in the sysroot only as leftovers of earlier cross-emerges, and after
+# the sysroot's perl moves (5.42 -> 5.44) they block every later sysroot
+# graph. They cannot be rebuilt there either: XS modules only build natively,
+# and a qemu chroot of the sysroot runs on its CROSS make.conf, whose ROOT
+# (/usr/<tuple>/) exists inside the chroot as binutils' target dir — every
+# ebuild then dies "merged-usr profile, but disk is split-usr" (2026-10-09).
+# So unmerge them — but only when nothing non-perl in the sysroot depends on
+# them and none is in its world file; otherwise stop and say why.
+sysroot_perl_prune() {
+    local sr="/usr/${PROF_TUPLE}" atoms users inworld
+    atoms=$(cd "${sr}/var/db/pkg" 2>/dev/null &&
+            ls -d dev-perl/* perl-core/* virtual/perl-* 2>/dev/null | sed -E 's/-[0-9].*//' | sort -u | tr '\n' ' ')
+    if [[ -z ${atoms// } ]]; then
+        info "sysroot: no perl modules installed — nothing to prune"
+        return 0
+    fi
+    local perlstale; perlstale=$(stale_consumers "${sr}" | awk -F'\t' '$2=="dev-lang/perl"')
+    stale_check
+    if [[ -z ${perlstale} ]]; then
+        info "sysroot: perl modules match the installed perl — kept"
+        return 0
+    fi
+    users=$(cd "${sr}/var/db/pkg" && grep -lE '(dev-perl|perl-core|virtual/perl-)' ./*/*/RDEPEND ./*/*/DEPEND 2>/dev/null |
+            sed -E 's|^\./||; s|/[A-Z]*DEPEND$||' | grep -vE '^(dev-perl|perl-core|virtual)/' | sort -u | tr '\n' ' ') || true
+    # no match is the GOOD case: grep exits 1, which pipefail + set -e would turn fatal
+    inworld=$(grep -E '^(dev-perl|perl-core|virtual/perl-)' "${sr}/var/lib/portage/world" 2>/dev/null | tr '\n' ' ') || true
+    [[ -z ${users// } && -z ${inworld// } ]] ||
+        die "sysroot perl modules are bound to the old perl but still needed (users: ${users:-none}; world: ${inworld:-none}) — rebuild them natively, they cannot cross-build"
+    info "sysroot: unmerging $(wc -w <<<"${atoms}") stale perl modules (unused there; cross builds run the host's perl)"
+    mkdir -p /var/tmp/xarm
+    printf '%s\n' ${atoms} > "/var/tmp/xarm/perl-prune.$(date +%F_%H%M%S).log"
+    info "removed list logged to /var/tmp/xarm/perl-prune.<timestamp>.log"
+    # shellcheck disable=SC2086 — word splitting of the atom list is intended
+    "${PROF_TUPLE}-emerge" --unmerge ${atoms}
+}
+
+# update_qt_lockstep — bring every installed dev-qt/*:6 in the sysroot to the
+# version portage would pick for qtbase, one package at a time.
+#
+# A plain '-uDN @world' cannot do this (2026-10-08, Qt 6.11.1 -> 6.11.2):
+# every Qt module pins ~qtbase-<same ver>, a module in the set RDEPENDs on
+# ~qttranslations-<ver>, and qttranslations' cmake needs the SYSROOT's
+# Qt6Linguist (from qttools) at that exact version. Portage orders
+# qttranslations before qttools, it fails on "Qt6Linguist 6.11.2 requested,
+# 6.11.1 found", --keep-going drops the rest, and the sysroot is left
+# half-upgraded (qtbase new, everything else old) — after which even
+# '-1 qttools' is a slot conflict. --nodeps in this fixed order is the way
+# out; it is idempotent, so a rerun after a failure resumes.
+update_qt_lockstep() {
+    local want have p ver order=()
+    want=$(sysroot_portageq best_visible dev-qt/qtbase:6)
+    [[ -n ${want} ]] || { info "Qt: no dev-qt/qtbase:6 visible in the sysroot — skipped"; return 0; }
+    ver=${want#dev-qt/qtbase-}; ver=${ver%%-r*}
+    # every installed Qt 6 module, core ones first, qttools then
+    # qttranslations last (qttranslations needs the new Linguist)
+    for p in qtbase qtshadertools qtsvg qtdeclarative; do
+        [[ -n $(sysroot_portageq best_version "dev-qt/${p}:6") ]] && order+=("${p}")
+    done
+    while read -r p; do
+        case ${p} in qtbase|qtshadertools|qtsvg|qtdeclarative|qttools|qttranslations) continue ;; esac
+        order+=("${p}")
+    done < <(sysroot_portageq match "dev-qt/*:6" | sed -E 's|^dev-qt/||; s/-[0-9].*//' | sort -u)
+    for p in qttools qttranslations; do
+        [[ -n $(sysroot_portageq best_version "dev-qt/${p}:6") ]] && order+=("${p}")
+    done
+    for p in "${order[@]}"; do
+        have=$(sysroot_portageq best_version "dev-qt/${p}:6")
+        if [[ ${have} == "dev-qt/${p}-${ver}"* ]]; then continue; fi
+        info "Qt lockstep: ${have:-dev-qt/${p} (missing)} -> ${ver}"
+        EMERGE_DEFAULT_OPTS="" "${PROF_TUPLE}-emerge" --oneshot --nodeps \
+            --usepkg --buildpkg "=dev-qt/${p}-${ver}*" ||
+            die "Qt lockstep stopped at dev-qt/${p}-${ver} — fix it, then rerun: sudo xp ${PROF} update"
+    done
+    info "Qt: sysroot modules all at ${ver}"
+}
+
+# --- run lock (xp_lock above): read-only verbs pass, everything else locks its tree
+case "${VERB}" in
+    status|log|qlop|qlog|binhost|distcc) ;;
+    thp) ;;                                    # the running kernel's sysfs, no build tree involved
+    run|kernel) xp_lock "xlab-${L:-none}" ;;   # the QEMU lab tree, shared by every profile with this xlab target
+    *)          xp_lock "$(lock_key)" ;;
+esac
+
 case "${VERB}" in
 status)
-    no_args "$@"
+    # --du: also walk the rootfs for its size (minutes on a built image; off by default)
+    [[ $# -eq 0 || ( $# -eq 1 && $1 == --du ) ]] || die "Usage: xp ${PROF} status [--du]"
     if is_board; then "$(xarm_bin)" status || warn "xarm status failed"; fi
     "${XSTAGE}" "${T}" status || warn "xstage status failed"
-    is_board || "${XSTAGE}" "${T}" live-status || warn "xstage live-status failed"
+    is_board || "${XSTAGE}" "${T}" live-status "$@" || warn "xstage live-status failed"
     "${XLAB}" "${L}" status || warn "xlab status failed"
     ;;
 setup)
@@ -242,6 +585,9 @@ enter)
         /*)      root="$1"; shift ;;
     esac
     if [[ ! -d ${root} ]]; then
+        # an interactive shell may fall back to the sysroot; a COMMAND must
+        # not — "xp <prof> enter 'emerge -C foo'" would hit the shared sysroot
+        [[ $# -eq 0 ]] || die "No ${root} — refusing to run '$*' in the shared sysroot instead; pass 'sysroot' explicitly"
         warn "No ${root} yet — falling back to the sysroot /usr/${PROF_TUPLE}"
         root="/usr/${PROF_TUPLE}"
     fi
@@ -286,7 +632,10 @@ sysroot-prep)
     else
         info "Pre-seeding sysroot: ${PROF_SYSROOT_PKGS}"
         # shellcheck disable=SC2086 — word splitting of the package list is intended
-        timed "$(xarm_bin)" emerge --oneshot -q ${PROF_SYSROOT_PKGS}
+        # not 'timed': timed ends in exit, which skipped the qca-fix below for
+        # every profile that sets PROF_SYSROOT_PKGS (found 2026-10-11)
+        time "$(xarm_bin)" emerge --oneshot -q ${PROF_SYSROOT_PKGS} ||
+            die "sysroot pre-seed failed — fix it, then rerun: sudo xp ${PROF} sysroot-prep"
     fi
     # Idempotent and safe even if qca wasn't in PROF_SYSROOT_PKGS or isn't
     # installed yet — re-run once qca lands (e.g. after the real 'pkgs').
@@ -299,22 +648,124 @@ pkgs)
     if ! is_board; then timed "${XSTAGE}" "${T}" pkgs; fi
     [[ -n ${PROF_PKGS:-} ]] || die "Profile ${PROF} sets no PROF_PKGS"
     root="$(prof_build_dir)/rootfs"
-    [[ -d ${root} ]] || die "No ${root} — run: sudo xp ${PROF} build"
-    # The emerge below COMPILES with the cross gcc and LINKS against ITS
-    # libstdc++, while the binaries RUN against whatever gcc-config selected
-    # inside the rootfs. A major gap is invisible here and fatal on the board
-    # ("GLIBCXX_3.4.35 not found"), so refuse rather than build something
-    # unloadable. Not fixed automatically: aligning them can mean an hours-long
-    # native gcc build, which must not start as a surprise inside another verb.
-    _xg=$("${PROF_TUPLE}-gcc" -dumpversion 2>/dev/null | cut -d. -f1)
-    _rg=$(ROOT="${root}/" gcc-config -c "${PROF_TUPLE}" 2>/dev/null |
-          sed -n "s|^${PROF_TUPLE}-\([0-9]\+\).*|\1|p")
-    [[ -z ${_xg} || -z ${_rg} || ${_xg} == "${_rg}" ]] ||
-        die "${root} is on gcc-${_rg}, cross toolchain is gcc-${_xg} — cross-built C++ would not load on the board. Run first: sudo xp ${PROF} rootgcc"
+    # a portage ROOT, not merely a directory: an empty rootfs/ would get a
+    # whole system cross-emerged into it
+    [[ -d ${root}/var/db/pkg ]] || die "No portage ROOT at ${root} (no var/db/pkg) — run: sudo xp ${PROF} build"
+    rootgcc_guard "${root}"
     info "Installing into ${root}: ${PROF_PKGS}"
     # shellcheck disable=SC2086 — word splitting of the package list is intended
     timed "${PROF_TUPLE}-emerge" --root="${root}" --root-deps=rdeps \
         --usepkg --buildpkg --oneshot -q ${PROF_PKGS}
+    ;;
+update)
+    # Full system update of a board: sysroot first (what the cross builds
+    # link against), then the rootfs (what goes on the card), with
+    # $PROF_PKGS merged on top. 'pkgs' only installs the list; this moves
+    # everything. Order and every step below came out of the 2026-10-08
+    # rpi400kde Qt 6.11.1->6.11.2 / Plasma 6.6->6.7 update; each one fixed a
+    # real failure. Idempotent: after a failure, fix it and rerun.
+    need_board
+    dry=0
+    case "${1:-}" in -n|--pretend) dry=1; shift ;; esac
+    no_args "$@"
+    [[ -n ${PROF_PKGS:-} ]] || die "Profile ${PROF} sets no PROF_PKGS"
+    root="$(prof_build_dir)/rootfs"
+    [[ -d ${root} ]] || die "No ${root} — run: sudo xp ${PROF} build"
+    rootgcc_guard "${root}"
+    # gcc is never updated here: the rootfs gcc must stay on the cross
+    # toolchain's major, and moving it is 'rootgcc', an explicit hours-long
+    # verb. The profile adds packages it cannot (or will not) move now.
+    xa="sys-devel/gcc ${PROF_UPDATE_EXCLUDE:-}"
+    xb="${xa} ${PROF_UPDATE_ROOTFS_EXCLUDE:-}"
+    # --with-bdeps=n: build-only deps resolve on the host through the cross
+    # wrapper; the arch-independent ones cmake finds IN the sysroot
+    # (extra-cmake-modules, ...) are PROF_SYSROOT_PKGS, updated in step 3.
+    # --ignore-built-slot-operator-deps: the RECORDED :=-subslots of installed
+    # packages are what let a held package (cryptography on cffi:0/2.0.0=)
+    # block the whole graph. Safe here because every stale :=-consumer is
+    # named explicitly below (stale_consumers), which is the only job those
+    # recorded subslots would have done (2026-10-09).
+    a_args=(-uDN --with-bdeps=n --keep-going --usepkg --buildpkg --ignore-built-slot-operator-deps=y
+            --exclude "${xa}" @world)
+    # shellcheck disable=SC2206 — word splitting of the package list is intended
+    b_args=(--root="${root}" --root-deps=rdeps -uDN --with-bdeps=n --keep-going
+            --usepkg --buildpkg --ignore-built-slot-operator-deps=y --exclude "${xb}" @world ${PROF_PKGS})
+    # EMERGE_DEFAULT_OPTS="" everywhere: a host --update/--deep would leak in
+    export EMERGE_DEFAULT_OPTS=""
+    if (( dry )); then
+        info "Dry run — sysroot plan, then rootfs plan (the sysroot config is NOT retuned in a dry run)"
+        info "sysroot stale :=-consumers: $(stale_consumers "/usr/${PROF_TUPLE}" | cut -f1 | sort -u | tr '\n' ' ')"
+        info "rootfs stale :=-consumers: $(stale_consumers "${root}" | cut -f1 | sort -u | tr '\n' ' ')"
+        # shellcheck disable=SC2046 — word splitting of the atom lists is intended
+        "${PROF_TUPLE}-emerge" -p "${a_args[@]}" $(drop_held "$(stale_consumers "/usr/${PROF_TUPLE}" | cut -f1 | sort -u | tr '\n' ' ')" "${xa}") ||
+            warn "sysroot plan did not resolve"
+        # shellcheck disable=SC2046
+        "${PROF_TUPLE}-emerge" -p "${b_args[@]}" $(drop_held "$(stale_consumers "${root}" | cut -f1 | sort -u | tr '\n' ' ')" "${xb}") ||
+            warn "rootfs plan did not resolve"
+        exit 0
+    fi
+    # every step needs its own || die: timed runs this under "|| rc=$?",
+    # which switches set -e off inside the function
+    update_run() {
+        # 1. the sysroot is shared by every ARM profile: point its portage
+        #    config at THIS one (xarm tune without XPROFILE wipes fragments)
+        info "1/7 xarm tune for ${PROF}"
+        XPROFILE="${PROF}" "$(xarm_bin)" tune || die "xarm tune failed"
+        # 2. Qt must move as one set, in an order portage will not pick
+        info "2/7 Qt lockstep in the sysroot"
+        update_qt_lockstep
+        # 3. sysroot pre-seed set: cmake-config packages a KF6/Plasma bump
+        #    needs at the new version (ECM 6.27 vs "requested 6.29" otherwise)
+        if [[ -n ${PROF_SYSROOT_PKGS:-} ]]; then
+            info "3/7 updating PROF_SYSROOT_PKGS in the sysroot"
+            # shellcheck disable=SC2086
+            "${PROF_TUPLE}-emerge" --oneshot -u --usepkg --buildpkg --exclude "${xa}" ${PROF_SYSROOT_PKGS} ||
+                die "sysroot pre-seed update failed — fix it, then rerun: sudo xp ${PROF} update"
+        fi
+        # 4. qca re-merged = host paths back in its cmake export, and the
+        #    next KF6 link picks the HOST libqca ("file in wrong format",
+        #    kwallet-runtime). Move it now, alone, and repatch before @world.
+        if [[ -n $(sysroot_portageq best_version app-crypt/qca) ]]; then
+            info "4/7 qca update + qca-fix"
+            "${PROF_TUPLE}-emerge" --oneshot -u --usepkg --buildpkg app-crypt/qca ||
+                die "qca update failed — fix it, then rerun: sudo xp ${PROF} update"
+        fi
+        "$(xarm_bin)" qca-fix || die "xarm qca-fix failed"
+        # 4b. binpkgs whose version has left the tree: with --usepkg the
+        #     resolver reaches for them (qtbase-6.11.1, kio-6.27) to satisfy
+        #     stale consumers and the graph ends in a slot conflict. eclean-pkg
+        #     without --deep removes exactly those (169 files / 2 GB, 2026-10-09).
+        info "4b/7 removing binpkgs whose ebuild left the tree"
+        PORTAGE_CONFIGROOT="/usr/${PROF_TUPLE}" eclean-pkg ||
+            warn "eclean-pkg failed — stale binpkgs may cause slot conflicts"
+        # 5. stale perl modules pruned (sysroot_perl_prune), then the sysroot
+        #    world with every remaining stale :=-consumer named as an atom.
+        #    Stop on failure: the rootfs builds against the sysroot.
+        info "5/7 sysroot: prune stale perl modules, then -uDN @world (excluding: ${xa})"
+        sysroot_perl_prune ||
+            die "sysroot perl prune failed — fix it, then rerun: sudo xp ${PROF} update"
+        stale=$(drop_held "$(stale_consumers "/usr/${PROF_TUPLE}" | cut -f1 | sort -u | tr '\n' ' ')" "${xa}")
+        stale_check
+        # shellcheck disable=SC2086 — word splitting of the atom list is intended
+        "${PROF_TUPLE}-emerge" "${a_args[@]}" ${stale} &&
+            stale_rebuild "/usr/${PROF_TUPLE}" "${xa}" ||
+            die "sysroot update had failures (see above) — fix them, then rerun: sudo xp ${PROF} update"
+        # 6. a qca bump inside step 5 would have undone step 4
+        info "6/7 qca-fix"
+        "$(xarm_bin)" qca-fix || die "xarm qca-fix failed"
+        # 7. the rootfs world + the profile's package list
+        # 7. the rootfs: perl alignment, then world + PROF_PKGS + its own
+        #    stale :=-consumers
+        info "7/7 rootfs: perl alignment, then -uDN @world + PROF_PKGS (excluding: ${xb})"
+        perl_align "${root}" ||
+            die "rootfs perl alignment failed — fix it, then rerun: sudo xp ${PROF} update"
+        stale=$(drop_held "$(stale_consumers "${root}" | cut -f1 | sort -u | tr '\n' ' ')" "${xb}")
+        stale_check
+        # shellcheck disable=SC2086 — word splitting of the atom list is intended
+        "${PROF_TUPLE}-emerge" "${b_args[@]}" ${stale} &&
+            stale_rebuild "${root}" "${xb}"
+    }
+    timed update_run
     ;;
 seed|snapshot|spec|stage1|stage2|stage3|all|verify)
     # 'seed' on a native profile fetches the flavour the profile asks for
@@ -371,6 +822,21 @@ lock|unlock)
     need_native
     exec "${XSTAGE}" "${T}" "${VERB}" "$@"
     ;;
+thp)
+    # run-time switch of transparent hugepages on the running kernel; nothing
+    # is written to disk, so the next boot is back at the kernel's default
+    is_host || die "'thp' acts on the running kernel — use 'xp host thp [always|madvise|never]'"
+    thp=/sys/kernel/mm/transparent_hugepage
+    [[ -r ${thp}/enabled ]] || die "This kernel has no transparent hugepage support (${thp}/enabled is missing)"
+    if [[ $# -gt 0 ]]; then
+        case "$1" in always|madvise|never) ;; *) die "thp: '$1' is not one of always, madvise, never" ;; esac
+        [[ ${EUID} -eq 0 ]] || die "thp: switching needs root — sudo xp host thp $1"
+        echo "$1" > "${thp}/enabled" || die "thp: the kernel refused '$1'"
+    fi
+    info "transparent hugepages: $(<"${thp}/enabled")   defrag: $(<"${thp}/defrag")"
+    info "in use now: $(awk '/^AnonHugePages/{printf "%.1f GiB anonymous", $2/1048576}' /proc/meminfo)"
+    exit 0
+    ;;
 clean-world)
     # one verb, two real targets: profile 'host' audits the running system's
     # world file, a native profile the live image's (xstage adds -r rootfs).
@@ -420,8 +886,14 @@ sd)
     timed "${XSTAGE}" "${T}" sd "$1"
     ;;
 binhost)
-    need_board; no_args "$@"
-    exec "$(xarm_bin)" binhost "${LAB_BINHOST_PORT}"
+    # board: the cross sysroot's cache via xarm; native live profile: the image's
+    # own binpkg cache (one -march per cache), optional port argument
+    if is_board; then
+        no_args "$@"
+        exec "$(xarm_bin)" binhost "${LAB_BINHOST_PORT}"
+    fi
+    need_native
+    exec "${XSTAGE}" "${T}" binhost "$@"
     ;;
 distcc)
     need_board

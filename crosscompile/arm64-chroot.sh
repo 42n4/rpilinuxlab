@@ -29,6 +29,9 @@ fi
 
 # OC flags → the kernel resolves the interpreter inside the chroot: static qemu must be there
 install -m755 "${QEMU_BIN}" "${CHROOT}/usr/bin/" || die "Cannot copy ${QEMU_BIN}"
+# rm first: if the chroot's resolv.conf is an absolute symlink (systemd stage3),
+# cp would write through it onto the HOST's file
+command rm -f "${CHROOT}/etc/resolv.conf"
 cp -L /etc/resolv.conf "${CHROOT}/etc/resolv.conf" || die "resolv.conf copy failed"
 
 MOUNTED=()
@@ -44,7 +47,8 @@ do_mount() {
     mkdir -p "${tgt}"
     case "$1" in
         proc)  mountpoint -q "${tgt}" || mount -t proc proc "${tgt}" ;;
-        rbind) mountpoint -q "${tgt}" || { mount --rbind "$3" "${tgt}"; mount --make-rslave "${tgt}"; } ;;
+        # one mount process: a Ctrl-C between two leaves a shared peer of the host's /sys
+        rbind) mountpoint -q "${tgt}" || mount --rbind --make-rslave "$3" "${tgt}" ;;
         bind)  mountpoint -q "${tgt}" || mount --bind "$3" "${tgt}" ;;
     esac
     MOUNTED+=("${tgt}")
@@ -56,13 +60,18 @@ do_mount() {
 GENTOO_REPO=$(portageq get_repo_path / gentoo)
 HOST_DISTDIR=$(portageq distdir)
 
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 do_mount proc  /proc
 do_mount rbind /dev /dev
 do_mount rbind /sys /sys
 do_mount bind  /tmp /tmp
-do_mount bind  /var/db/repos/gentoo "${GENTOO_REPO}"
-do_mount bind  /var/cache/distfiles "${HOST_DISTDIR}"
+# sources = the host's REAL paths (resolved above), not the stock defaults:
+# with /var/cache/distfiles hard-coded the chroot never saw the host's
+# /var/tmp/distfiles pool (audit 2026-10-11)
+do_mount bind  "${GENTOO_REPO}"  "${GENTOO_REPO}"
+do_mount bind  "${HOST_DISTDIR}" "${HOST_DISTDIR}"
 
 rc=0
 if [[ $# -eq 0 ]]; then

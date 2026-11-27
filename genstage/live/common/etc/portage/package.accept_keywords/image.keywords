@@ -30,6 +30,16 @@ dev-python/docstring-parser **
 # the repo rather than by hitting them one failed run at a time.
 dev-util/catalyst
 app-misc/qwen-code
+dev-util/claude-code::pwr
+# Agent-configuration and skill checkers (::pwr, 2026-11-25), listed in
+# amdkdehard; the two dev-python entries are dependencies of skillspector-static.
+dev-util/ctxlint::pwr
+dev-util/ctxlint-yaw::pwr
+dev-util/agentshield::pwr
+dev-util/skillspector-static::pwr
+dev-util/skil-lock::pwr
+dev-python/pywhatwgurl::pwr
+dev-python/tree-sitter-typescript::pwr
 
 # Testing-only DEPENDENCIES, found by resolving the whole graph rather than by
 # hitting them one failed run at a time. The host's list could not cover these:
@@ -105,7 +115,7 @@ media-libs/shaderc
 # 'xp <profile> restrict-run'. webkit-gtk:4 is the slot ::gentoo dropped, so it
 # only exists in ::pwr and only as ~amd64; the client itself is ~amd64 because
 # nothing about a vendor binary earns a stable keyword.
-=net-libs/webkit-gtk-2.48.3-r1 ~amd64
+=net-libs/webkit-gtk-2.48.3* ~amd64
 net-vpn/cisco-secure-client ~amd64
 
 # nvidiahard unsloth/vllm chain via ::stuff (2026-08-08): the five ~amd64
@@ -128,6 +138,12 @@ app-misc/ddcci-driver-linux
 # launcher repacked from the upstream GitHub-releases .deb — real version,
 # KEYWORDS="-* ~amd64", pinned distfile, so a bare atom like ddcci above.
 games-util/modrinth-app-bin
+
+# games-action/prismlauncher (::pwr 11.1.0, copied from ::gentoo 11.0.3
+# 2026-09-25): ::gentoo stable is 9.4-r1; the ::pwr bump is KEYWORDS="~amd64
+# ~arm64" with a pinned release tarball, so a bare atom. Pulls
+# app-text/cmark, dev-cpp/tomlplusplus and dev-qt/qtnetworkauth (all stable).
+games-action/prismlauncher
 
 # nvidiahard, 2026-08-19. The Trezor set (::pwr): trezor-suite-bin is
 # KEYWORDS="-* ~amd64" (prebuilt Electron, amd64 only by construction),
@@ -168,9 +184,69 @@ dev-python/mcp-types
 # corehard.
 dev-util/perf
 
+# dev-util/ruff: ::gentoo dropped the last stable version (0.14.9, still the
+# installed one on the host and in every image seeded before 2026-09); only
+# ~amd64 0.16.x remain, so a listed-but-masked atom made 'pkgs' report a
+# broken world file (ryzenhard, 2026-09-27). Unversioned: the next stable
+# release makes the entry harmless rather than wrong.
+dev-util/ruff
+
+# sys-power/uhubctl: per-port USB power switching, listed in amdkdehard (so in
+# every hard profile) 2026-09-27. ::gentoo has only ~amd64 (2.5.0); bare atom.
+sys-power/uhubctl
+
+# x11-apps/igt-gpu-tools (intel_gpu_top), intelhard + corehard 2026-09-28:
+# ::gentoo has only ~amd64 2.3 (the 9999 has no KEYWORDS, so a bare atom
+# cannot select it).
+x11-apps/igt-gpu-tools
+
 # app-misc/keyd (::pwr, imported from ::guru 2026-09-09): key remapping daemon,
 # KEYWORDS="~amd64 ~arm64 ~x86" upstream, so a bare atom like ddcci above.
 # acct-group/keyd needs no entry: acct-group.eclass keywords it stable on amd64.
 # Only the *hard profiles list the atom (amdkdehard and its children); this file
 # is the shared 'common' layer, so the keyword is harmless where it is unused.
 app-misc/keyd
+
+# EasyEffects 8.0.5 (amdkdehard and every hard child, 2026-10-03): ::gentoo has
+# 8.x only as ~amd64 (7.2.5 is the stable GTK4 line), and 8.x needs the
+# webrtc-audio-processing:2 slot, ~amd64 only (2.1). Slot-limited so the stable
+# :0/:1 slots other consumers use stay on stable keywords.
+media-sound/easyeffects
+media-libs/webrtc-audio-processing:2
+# CamillaDSP upstream binary (::pwr, 2026-10-12), ~amd64 ~arm64 only
+media-sound/camilladsp-bin
+
+# dev-python/opentelemetry-exporter-http-transport (::stuff, new package): the
+# opentelemetry 1.45.0 wave splits it out of exporter-otlp-proto-http, which now
+# requires ~1.45.0 of it. The rest of the family is accepted bare in
+# host.keywords; this one is not there yet (xp nvidiahard pkgs, 2026-10-03).
+dev-python/opentelemetry-exporter-http-transport
+# Same wave: opentelemetry-exporter-otlp-common-1.45.0 is a second new package
+# that exporter-otlp-proto-http-1.45.0 requires (~${PV}). Checked the whole
+# family in ::stuff at 1.45.0 - these two were the only atoms not yet accepted.
+dev-python/opentelemetry-exporter-otlp-common
+
+# dev-python/httpx2: openai-3.24.0 (::stuff) requires >=httpx2-2.12.0; ::gentoo
+# keeps 2.12.0-2.13.1 at ~amd64 only (the installed 2.10.0 has left the tree).
+# Its runtime deps (anyio 4.14, idna 3.18+, h11 0.16, truststore 0.10) are all
+# stable and already installed. ::stuff's split httpx2/httpcore2 pair is masked in
+# zz-image.mask, so this resolves to ::gentoo's combined httpx2.
+dev-python/httpx2
+
+# fastfetch (host.keywords) 2.69.0 needs >=dev-libs/yyjson-0.13.0, ~amd64 only (2026-10-03).
+dev-libs/yyjson
+# --- chezmoi (2026-10-07) ---------------------------------------------------
+# app-admin/chezmoi-bin (::pwr, KEYWORDS="-* ~amd64 ~arm64"): dotfile manager,
+# in amdkde's and amdkdehard's overlay lists (all hard x86 children inherit).
+app-admin/chezmoi-bin
+# --- qemu 11 (2026-10-28) ---------------------------------------------------
+# app-emulation/qemu is ~amd64 via host.keywords; qemu-11.1.2-r1 needs
+# >=dev-python/qemu-qmp-0.0.5, whose only ebuild (0.0.6) is ~amd64. Without it
+# the update is skipped on every pkgs run and costs backtracks.
+dev-python/qemu-qmp
+
+# --- pam_mount 2.23 (2026-10-31) --------------------------------------------
+# sys-auth/pam_mount is ~amd64 via host.keywords; pam_mount-2.23 needs
+# >=sys-libs/libhx-5.5:=, and libhx 5.4/5.5 are ~amd64 only (5.3 stable). The
+# host still runs pam_mount-2.22 + libhx-5.3, so its list never named libhx.
+sys-libs/libhx

@@ -4,7 +4,7 @@
 # {moje,systemowe}.keywords, taken 2026-08-04.
 #
 # Why the image needs it at all: PROF_LIVE_PKGS in profiles/amdkdehard.conf
-# is this host's world(5), and 45 of those atoms — awscli-bin, keepassxc,
+# is this host's world(5), and 45 of those atoms — awscli, keepassxc,
 # suricata, lynis, hashcat, zen-sources, every *-bin browser, all twelve
 # ::pwr overlay atoms — have no stable amd64 keyword. A keyword mask is a
 # resolver error, so emerge aborts the whole run on the first one rather than
@@ -53,7 +53,7 @@ acct-user/trezord
 app-accessibility/at-spi2-atk
 app-accessibility/onboard
 app-admin/aws-cli
-app-admin/awscli-bin
+app-admin/awscli
 app-admin/aws-session-manager-plugin
 app-admin/aws-vault
 app-admin/bitwarden-cli-bin
@@ -445,6 +445,9 @@ dev-python/attrs
 dev-python/automat
 #dev-python/awscli
 dev-python/awscli
+dev-python/awscrt
+dev-libs/aws-c-io
+dev-libs/aws-c-s3
 dev-python/aws-sam-cli
 dev-python/aws-sam-translator
 dev-python/backcall
@@ -1136,6 +1139,7 @@ kde-plasma/kscreenlocker
 kde-plasma/ksshaskpass
 kde-plasma/ksysguard
 kde-plasma/ksystemstats
+kde-plasma/kup
 kde-plasma/kwallet-pam
 kde-plasma/kwayland
 kde-plasma/kwayland-integration
@@ -1262,7 +1266,6 @@ media-libs/libwebp
 media-libs/libwmf
 media-libs/libzmf
 media-libs/mesa
-media-libs/mesa
 media-libs/nv-codec-headers
 media-libs/nvidia-vaapi-driver
 #media-libs/opencv
@@ -1356,7 +1359,16 @@ net-libs/nghttp2
 #net-libs/nodejs
 net-libs/rpcsvc-proto
 net-libs/serf
-net-libs/webkit-gtk
+# net-libs/webkit-gtk is deliberately NOT keyworded here. A bare atom accepts
+# ~amd64 in EVERY slot, which is not what this stack wants: slots 4.1 and 6 are
+# stable at 2.52.6-r410/-r600 and are to stay there, while a bare entry would
+# pull 2.54.0 in both — two of the longest C++ builds in the tree, for nothing
+# (they are also why net-libs/webkit-gtk is capped to j12 in package.env).
+# The ONLY ~arch webkit this stack needs is slot 4, which ::gentoo dropped and
+# ::pwr carries: Cisco Secure Client's acwebhelper links libwebkit2gtk-4.0.so.37
+# and slots 4.1/6 do not substitute (different soname, and only the :4 ebuild
+# builds -DUSE_SOUP2=ON). That one is pinned by exact version in image.keywords
+# as '=net-libs/webkit-gtk-2.48.3* ~amd64' (-r1, and -r2 with python3_14) — keep it there, not here.
 net-misc/bridge-utils
 net-misc/curl
 net-misc/dropbox
@@ -1425,6 +1437,9 @@ sci-biology/admixtools
 sci-biology/eigensoft
 sci-biology/plink
 sci-biology/plink2-bin
+sci-biology/bcftools
+sci-biology/samtools
+sci-libs/htslib
 sci-libs/armadillo
 sci-libs/arpack
 sci-libs/arprec
@@ -1621,6 +1636,7 @@ sys-libs/tdb
 sys-libs/tevent
 sys-libs/zlib
 sys-power/acpi
+sys-power/asusctl
 sys-power/bbswitch
 sys-power/cpufrequtils
 sys-power/powertop
@@ -1751,8 +1767,8 @@ x11-misc/lightdm
 x11-misc/picom-jonaburg
 x11-misc/primus 
 x11-misc/read-edid
-x11-misc/sddm
-x11-misc/sddm
+gui-apps/sddm
+gui-apps/sddm
 x11-misc/virtualgl
 x11-misc/x11vnc
 x11-misc/xsettingsd
@@ -1799,3 +1815,17 @@ dev-python/libusb1
 net-misc/ntfy-bin
 acct-group/ntfy
 acct-user/ntfy
+
+# 2026-09-21: dev-python/jiter-0.17 (::stuff) needs >=maturin-1.15, ~amd64 only
+dev-util/maturin
+# aiohttp 3.14.4 (vllm/unsloth-zoo chain) needs >=yarl-1.25.1, ~amd64 only (2026-10-10)
+~dev-python/yarl-1.25.1 ~amd64
+dev-python/nvidia-cutlass-dsl-libs-core
+dev-python/oss-harmony
+sci-biology/glimpse
+sci-biology/beagle
+sci-biology/refined-ibd
+sci-biology/relate
+dev-python/scikit-allel
+dev-python/ancibd
+sci-biology/bwa

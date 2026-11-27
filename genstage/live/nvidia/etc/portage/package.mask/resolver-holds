@@ -1,0 +1,43 @@
+# Resolver holds (2026-10-04). Each entry is an update that an INSTALLED package forbids,
+# so emerge can never take it - but it retried every one on every run and backtracked
+# (~10-12 s per backtrack, the whole graph is rebuilt). Holding them at the installed
+# version leaves the merge plan identical and cut 'pkgs' pass 1 from 177 s / 10 backtracks
+# to 70 s / 2 (nvidiahard, measured). A hold that outlives its blocker silently pins the
+# package, so every line names its lift trigger; re-check with this file moved aside:
+#   emerge -puDN @world   ->  "skipped due to a dependency conflict" lists what still blocks.
+
+# ::pwr carries gamescope 3.16.28 (bundled libdisplay-info); ::gentoo 3.16.31 cannot
+# replace it. Lift when ::pwr gets a 3.16.31+ bump.
+>gui-wm/gamescope-3.16.28
+
+# dev-python/cuda-core 1.2.1 and cuda-bindings 13.3.1 (::stuff) require <cython-3.3.
+# Without this the image flips cython 3.2.9 <-> 3.3.0 between runs. Lift when both accept 3.3.
+>=dev-python/cython-3.3
+
+# dev-python/cloudpickle 3.1.2 requires <flit-core-4. Lift when cloudpickle moves.
+# (Image only: the host already has flit-core 4.0.2, so its copy of this file omits it.)
+>=dev-python/flit-core-4
+
+# dev-python/anthropic 1.11.0 (::stuff) requires <docstring-parser-1, and ::pwr's
+# docstring-parser-9999 sorts above it. Lift when anthropic relaxes the bound.
+>=dev-python/docstring-parser-1
+
+# dev-python/scipy 1.18.x (1.18.0 and 1.18.1) requires >=dev-libs/boost-1.91.0, which is ~amd64 only and deliberately NOT
+# keyworded (#dev-libs/boost in host.keywords - a boost bump rebuilds every consumer). 2026-10-10.
+# Lift when boost >=1.91 goes stable, or when the boost keyword is taken on purpose.
+>=dev-python/scipy-1.18
+
+# 2026-10-28: dev-python/msgpack-1.2.4 needs >=cython-3.3, which the hold above forbids.
+# Lift together with the cython hold.
+>=dev-python/msgpack-1.2.4
+
+# 2026-10-28: every dev-python/tilelang in ::stuff (0.1.12-r1 .. 0.1.15-r1) pins
+# ~dev-python/apache-tvm-ffi-0.1.11. Lift when a tilelang accepts a newer tvm-ffi.
+>dev-python/apache-tvm-ffi-0.1.11
+
+# Qt 6.11.3 hold: lifted 2026-11-13 — ::gentoo dropped Qt 6.11.2, so the hold masked every dev-qt ebuild.
+
+# 2026-10-28: sci-ml/datasets (every ::gentoo version up to 5.1.0) requires
+# <sci-ml/huggingface_hub-2, and ::stuff carries huggingface_hub-2.3.0.
+# Lift when a datasets accepts huggingface_hub 2.
+>=sci-ml/huggingface_hub-2

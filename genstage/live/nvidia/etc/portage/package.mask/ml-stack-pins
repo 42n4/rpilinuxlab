@@ -17,25 +17,32 @@
 # API — see the pin at vllm-9999.ebuild:143 and memory project_pwr_overlay.
 
 # --- pinned by dev-python/vllm-9999 (~exact-version deps in the ebuild) -------
->dev-python/tilelang-0.1.9
->dev-python/humming-kernels-0.1.4
->dev-python/nvidia-cutlass-dsl-4.5.2
+# 2026-10-18 Evening C: tilelang pin 0.1.9 -> 0.1.12 (what the pinned vLLM commit requires), CUDA 13.4.3 + cuda-bindings/
+# cuda-python 13.4.4 allowed (13.4.1 tarball issue does not affect 13.4.4), toolkit >13.4.3 still held.
+>dev-python/tilelang-0.1.12-r1
+>dev-python/humming-kernels-0.1.18
+>dev-python/nvidia-cutlass-dsl-4.8.0
 # the CUTLASS sub-packages move in lockstep with the parent; 4.6.x also split
 # out a NEW one (nvidia-cutlass-dsl-libs-core) that does not exist at 4.5.2
->dev-python/nvidia-cutlass-dsl-libs-base-4.5.2
->dev-python/nvidia-cutlass-dsl-libs-cu13-4.5.2
+>dev-python/nvidia-cutlass-dsl-libs-base-4.8.0
+>dev-python/nvidia-cutlass-dsl-libs-cu13-4.8.0
+>dev-python/nvidia-cutlass-dsl-libs-core-4.8.0
 
 # --- flashinfer: python and cubin halves must match exactly ------------------
 # flashinfer-python-0.6.17 requires ~flashinfer-cubin-0.6.17 (vllm pin 7a100bb617); 0.6.18 would
 # drag in CUTLASS 4.6.2, which the vLLM pin above forbids.
->=dev-python/flashinfer-python-0.6.18
->=dev-python/flashinfer-cubin-0.6.18
+>dev-python/flashinfer-python-0.7.2_p1
+>dev-python/flashinfer-cubin-0.7.2_p1
 
 # --- pinned by other installed packages, not by vLLM -------------------------
 # dev-python/model-hosting-container-standards needs <dev-python/fastapi-0.137.0
 >=dev-python/fastapi-0.137.0
-# sci-ml/transformers-5.15 needs =sci-ml/tokenizers-0.22*
->=sci-ml/tokenizers-0.23
+# tokenizers follows transformers in lockstep: 5.15 needed =0.22*, 5.17 needs
+# >=0.23.1 <0.24 (2026-09-21: the wall at 0.23 made @installed die on
+# "tokenizers-0.23.2 masked" once ::stuff offered transformers-5.17). Nothing
+# else bounds transformers from above (vllm >=5.10.4, trl >=4.56.2, unsloth/peft
+# unbounded), so the pin only has to stop tokenizers running AHEAD of it.
+>=sci-ml/tokenizers-0.24
 
 # quack-kernels 0.6.x ALL require cutlass >=4.6.0 (0.6.1->4.6.0, 0.6.2/0.6.3->
 # 4.6.1, 0.6.4->4.6.2), so the entire 0.6 line is unreachable while the vLLM
@@ -43,7 +50,29 @@
 # dies on "nvidia-cutlass-dsl-4.6.2 masked" — the failure looks like a CUTLASS
 # problem but the package that moved is this one. Installed: 0.5.0, which asks
 # for ~4.5.2 and matches the wall exactly.
->dev-python/quack-kernels-0.5.0
+>dev-python/quack-kernels-0.6.5
+
+# nvidia-cudnn-frontend-1.29.0 (::stuff, 2026-09) requires >=nvidia-cutlass-dsl-4.6.2,
+# which the vLLM pin above forbids — same shape as quack-kernels: @installed
+# proposes 1.29.0 every run and update-seed dies on "nvidia-cutlass-dsl-4.6.2
+# masked" (2026-09-21, 16 min in). Installed: 1.28.0; its only consumer,
+# flashinfer-python-0.6.17, asks for >=1.25.0.
+>dev-python/nvidia-cudnn-frontend-1.31.0
+
+# --- ::stuff ebuilds that cannot merge (2026-09-21, seen on the host 09-20 too) ---
+# cuda-bindings-13.4.1: the GitHub tag tarball no longer matches ::stuff's
+# Manifest (3267640 bytes fetched vs 3267635 recorded — GitHub regenerated the
+# archive), so the fetch ends in a checksum failure; cuda-python-13.4.1 pins
+# ~cuda-bindings-13.4.1 and falls with it.
+# The rest of the CUDA 13.4 wave is held back anyway by xgrammar's
+# nvidia-cuda-toolkit:0/13.3.1= slot dep, so keep the python halves at 13.3 too.
+>dev-python/cuda-bindings-13.4.4
+>dev-python/cuda-python-13.4.4
+# cuda-tile-bin-1.6.0: python_install runs `installer` once per PYTHON_COMPAT impl
+# and the wheel ships a console script (usr/bin/cutile-cache) — the second impl
+# dies with FileExistsError. Ebuild bug; 1.5.0 installs and satisfies the
+# cutlass-dsl-libs dependency.
+>dev-python/cuda-tile-bin-1.5.0
 
 # dev-python/wxpython-4.3.1::stuff requires ~dev-python/sip-6.12.0, which is
 # OLDER than the installed sip-6.15.3 (::gentoo) and is not keyworded — so the
@@ -51,3 +80,25 @@
 # out at 4.2.5, which is what is installed and what nothing in this image
 # depends on anyway. Mask the ::stuff version rather than keyword an old sip.
 >=dev-python/wxpython-4.3.1
+# --- 2026-10-03: update-seed died on two more ::stuff bumps (xp nvidiahard pkgs) ---
+# nvidia-cuda-toolkit-13.4.2::stuff vs the installed 13.3.1-1::pwr: tilelang,
+# vllm-9999 and sci-ml/tensorpipe all carry `nvidia-cuda-toolkit:0/13.3.1=` slot
+# deps, and the installed tilelang-0.1.9-4 can no longer be rebuilt (0.1.9 is
+# gone from ::stuff, >0.1.9 is masked above for vLLM) — so the toolkit cannot
+# move until vLLM's tilelang pin moves. Same 13.4 wave as cuda-bindings above.
+>dev-util/nvidia-cuda-toolkit-13.4.3
+# fastsafetensors::stuff switched to DISTUTILS_SINGLE_IMPL (PYTHON_SINGLE_TARGET)
+# in EVERY version it still carries (0.2.2-r1, 0.3.3-r1, 0.4.0), but vllm-9999
+# asks for >=fastsafetensors-0.3.2[python_targets_python3_14] — a multi-impl USE
+# dep that a single-impl package can never satisfy. The installed 0.3.3 (r0,
+# multi-impl, gone from the repo) matches it, so hold everything above it. The
+# real fix is in ::pwr: vllm-9999's dep -> [${PYTHON_SINGLE_USEDEP}]; then drop this.
+# Both sides are needed: with only the upper bound, @installed DOWNGRADES to
+# 0.2.2-r1 (also single-impl) and hits the same conflict (2026-10-03, 3rd run).
+>dev-python/fastsafetensors-0.4.0
+# (2026-11-02: lower fastsafetensors bound dropped - vllm-9999 now asks for the single-impl ::stuff build)
+# --- 2026-11-02 step 3 (vllm b8c04dd3b4 + torch v2.15.0): the walls above were moved to the versions
+# that commit pins (requirements/cuda.txt); the 4.5.2/0.6.17 rationale in the comments is history.
+# xgrammar 0.2.8 comes from ::pwr (gcc 16 + c++20); the ::stuff copy RDEPENDs sys-devel/gcc:15.
+=dev-python/xgrammar-0.2.8::stuff
+>dev-python/xgrammar-0.2.8
